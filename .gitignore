@@ -1,0 +1,17 @@
+# pixi environments
+.pixi/*
+!.pixi/config.toml
+
+# data files (huge, not for git)
+data/
+
+# editor backups
+*~
+*.swp
+
+# Python
+__pycache__/
+*.pyc
+
+# Claude Code
+.claude/
