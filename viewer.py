@@ -110,6 +110,18 @@ DOT_COLORS = {
     'no_url':    (0.5, 0.5, 0.5),
     'not_image': (0.4, 0.4, 0.7),
 }
+# Vectorized color LUT indexed by STATUS_CODES value (0 = unchecked placeholder)
+STATUS_COLORS_LUT = np.array([
+    [0.05, 0.05, 0.05],  # 0: unchecked
+    [1.0,  0.6,  0.0 ],  # 1: pending
+    [0.0,  0.9,  0.0 ],  # 2: ok
+    [1.0,  1.0,  0.0 ],  # 3: moved
+    [1.0,  0.0,  0.0 ],  # 4: not_found
+    [0.7,  0.0,  0.0 ],  # 5: error
+    [0.8,  0.0,  0.8 ],  # 6: dns
+    [0.5,  0.5,  0.5 ],  # 7: no_url
+    [0.4,  0.4,  0.7 ],  # 8: not_image
+], dtype='f4')
 STATUS_CODES = {
     'pending': 1, 'ok': 2, 'moved': 3, 'not_found': 4,
     'error': 5, 'dns': 6, 'no_url': 7, 'not_image': 8,
@@ -507,9 +519,17 @@ class Viewer:
         else:
             self._fetched_index = {}
 
-        # dot shader
+        # dot shader + cached dot buffer
         self._dot_prog = self.ctx.program(
             vertex_shader=DOT_VERT, fragment_shader=DOT_FRAG)
+        self._dot_checked = np.empty(0, dtype=np.int64)
+        self._dot_gx = np.empty(0, dtype='f4')
+        self._dot_gy = np.empty(0, dtype='f4')
+        self._dot_buf = None
+        self._dot_vao = None
+        self._dot_n = 0
+        self._dot_last_rebuild = 0.0
+        self._rebuild_dots()
 
         print(f"Hilbert grid {SIDE}×{SIDE} (order {ORDER}) = {NUM_IMAGES:,} images", flush=True)
         print("Scroll=zoom  Drag=pan  Click=check  C=crawl  D=dim  R=reload  F=full  M=meta  L=dots  /=search  Esc/Q=quit", flush=True)
@@ -1184,6 +1204,52 @@ class Viewer:
                 uploaded = True
         return uploaded
 
+    def _rebuild_dots(self):
+        """Rebuild dot buffer. Caches grid positions, vectorizes colors."""
+        snapshot = np.array(self._link_status)
+        checked = np.nonzero(snapshot)[0].astype(np.int64)
+        n = len(checked)
+        if n == 0:
+            self._dot_n = 0
+            return
+        old_n = len(self._dot_checked)
+        if n != old_n:
+            if old_n == 0:
+                gx, gy = hilbert_d2xy(ORDER, checked)
+                self._dot_gx = gx.astype('f4')
+                self._dot_gy = gy.astype('f4')
+            else:
+                # Incremental: keep old positions, compute only new
+                old_in_new = np.searchsorted(checked, self._dot_checked)
+                full_gx = np.empty(n, dtype='f4')
+                full_gy = np.empty(n, dtype='f4')
+                full_gx[old_in_new] = self._dot_gx
+                full_gy[old_in_new] = self._dot_gy
+                is_new = np.ones(n, dtype=bool)
+                is_new[old_in_new] = False
+                new_idx = checked[is_new]
+                if len(new_idx) > 0:
+                    ngx, ngy = hilbert_d2xy(ORDER, new_idx)
+                    full_gx[is_new] = ngx.astype('f4')
+                    full_gy[is_new] = ngy.astype('f4')
+                self._dot_gx = full_gx
+                self._dot_gy = full_gy
+            self._dot_checked = checked.copy()
+        # Colors from mmap status codes (fully vectorized)
+        codes = snapshot[self._dot_checked]
+        vdata = np.empty((n, 5), dtype='f4')
+        vdata[:, 0] = self._dot_gx
+        vdata[:, 1] = self._dot_gy
+        vdata[:, 2:5] = STATUS_COLORS_LUT[codes]
+        if self._dot_buf is not None:
+            self._dot_buf.release()
+        if self._dot_vao is not None:
+            self._dot_vao.release()
+        self._dot_buf = self.ctx.buffer(vdata.tobytes())
+        self._dot_vao = self.ctx.vertex_array(
+            self._dot_prog, [(self._dot_buf, '2f 3f', 'grid_pos', 'color')])
+        self._dot_n = n
+
     def _manage_fetched_textures(self):
         """Evict off-screen textures, load visible cached images."""
         if self.ppi < FETCH_MIN_PPI:
@@ -1240,18 +1306,17 @@ class Viewer:
         self.vao.render(moderngl.TRIANGLE_STRIP)
 
         # ── undimmed ok cells (when dimmed + zoomed out past hi-res) ──
-        if self._dim_mode and self.ppi < FETCH_MIN_PPI:
-            with self._link_lock:
-                ok_indices = [i for i, s in self._link_checks.items()
-                              if s == 'ok']
-            if ok_indices:
-                ok_arr = np.array(ok_indices, dtype=np.int64)
-                gx, gy = hilbert_d2xy(ORDER, ok_arr)
-                # avg color from raw data: (N, CH, H, W) → mean over H,W → BGR→RGB
-                raw_avg = self.data[ok_arr].reshape(len(ok_arr), CH, -1).mean(axis=2)
-                vdata = np.empty((len(ok_arr), 5), dtype='f4')
-                vdata[:, 0] = gx.astype('f4')
-                vdata[:, 1] = gy.astype('f4')
+        if self._dim_mode and self.ppi < FETCH_MIN_PPI and self._dot_n > 0:
+            ok_mask = self._link_status[self._dot_checked] == STATUS_CODES['ok']
+            ok_count = ok_mask.sum()
+            if ok_count > 0:
+                ok_gx = self._dot_gx[ok_mask]
+                ok_gy = self._dot_gy[ok_mask]
+                ok_arr = self._dot_checked[ok_mask]
+                raw_avg = self.data[ok_arr].reshape(ok_count, CH, -1).mean(axis=2)
+                vdata = np.empty((ok_count, 5), dtype='f4')
+                vdata[:, 0] = ok_gx
+                vdata[:, 1] = ok_gy
                 vdata[:, 2] = raw_avg[:, 2] / 255.0  # R (was B)
                 vdata[:, 3] = raw_avg[:, 1] / 255.0  # G
                 vdata[:, 4] = raw_avg[:, 0] / 255.0  # B (was R)
@@ -1315,21 +1380,8 @@ class Viewer:
                 self._overlay_vao.render(moderngl.TRIANGLE_STRIP)
                 self.ctx.disable(moderngl.BLEND)
 
-        # ── link-check dots ──
-        if self._show_dots and self._link_checks:
-            with self._link_lock:
-                checks = dict(self._link_checks)
-            n = len(checks)
-            indices = np.array(list(checks.keys()), dtype=np.int64)
-            gx, gy = hilbert_d2xy(ORDER, indices)
-            vdata = np.empty((n, 5), dtype='f4')
-            vdata[:, 0] = gx.astype('f4')
-            vdata[:, 1] = gy.astype('f4')
-            for i, idx in enumerate(checks):
-                vdata[i, 2:5] = DOT_COLORS.get(checks[idx], (0.5, 0.5, 0.5))
-            buf = self.ctx.buffer(vdata.tobytes())
-            vao = self.ctx.vertex_array(
-                self._dot_prog, [(buf, '2f 3f', 'grid_pos', 'color')])
+        # ── link-check dots (cached buffer) ──
+        if self._show_dots and self._dot_n > 0 and self._dot_vao is not None:
             self.ctx.enable(moderngl.BLEND | moderngl.PROGRAM_POINT_SIZE)
             self.ctx.blend_func = (
                 moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
@@ -1337,10 +1389,8 @@ class Viewer:
             self._dot_prog['u_ppi'].value = self.ppi
             self._dot_prog['u_screen'].value = (float(self.w), float(self.h))
             self._dot_prog['u_square'].value = 0
-            vao.render(moderngl.POINTS)
+            self._dot_vao.render(moderngl.POINTS)
             self.ctx.disable(moderngl.BLEND | moderngl.PROGRAM_POINT_SIZE)
-            vao.release()
-            buf.release()
 
     # ── main loop ─────────────────────────────────────────────────────
     def run(self):
@@ -1362,6 +1412,15 @@ class Viewer:
                 if self._link_dirty:
                     self._link_dirty = False
                     self._dirty = True
+
+                # Rebuild dot buffer (throttled — heavy with 1M+ dots)
+                now = time.time()
+                if now - self._dot_last_rebuild > 0.5:
+                    old_n = self._dot_n
+                    self._rebuild_dots()
+                    self._dot_last_rebuild = now
+                    if self._dot_n != old_n:
+                        self._dirty = True
 
                 if self._upload_pending_fetches():
                     self._dirty = True
