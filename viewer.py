@@ -10,9 +10,16 @@ Controls:
   Q          quit
   Home       reset view
   /          search keywords (type to search, Esc/Enter to cancel)
+  Click      check source URL (shows colored dot)
+  L          toggle link-check dots and fetched overlays
 """
 
 import math, os, sys, time, threading
+import concurrent.futures
+import io
+import socket
+import urllib.request
+import urllib.error
 import numpy as np
 import glfw
 import moderngl
@@ -87,6 +94,26 @@ MAX_ZOOM =  5.0   # 32 display-px per image-px
 TITLE_ZOOM = -2.0 # show keyword in title bar at this zoom or closer
 DETAIL_MIN_PPI = 4 # show detail textures when images are ≥ this many px on screen
 META_OFFSET = (100, 100)  # overlay offset from cursor (right, down) in pixels
+
+LINK_TIMEOUT = 10
+DOT_COLORS = {
+    'pending':   (1.0, 0.6, 0.0),
+    'ok':        (0.0, 0.9, 0.0),
+    'moved':     (1.0, 1.0, 0.0),
+    'not_found': (1.0, 0.0, 0.0),
+    'error':     (0.7, 0.0, 0.0),
+    'dns':       (0.8, 0.0, 0.8),
+    'no_url':    (0.5, 0.5, 0.5),
+    'not_image': (0.4, 0.4, 0.7),
+}
+STATUS_CODES = {
+    'pending': 1, 'ok': 2, 'moved': 3, 'not_found': 4,
+    'error': 5, 'dns': 6, 'no_url': 7, 'not_image': 8,
+}
+STATUS_NAMES = {v: k for k, v in STATUS_CODES.items()}
+LINK_CACHE = os.path.join(os.path.dirname(FILENAME), 'link_status.bin')
+FETCH_MAX_SIZE = 512
+FETCH_MIN_PPI = 16
 
 # Max detail texture dimension (pixels).  16384 is safe on any modern GPU.
 MAX_TEX = 16384
@@ -206,6 +233,41 @@ void main() {
     frag = texture(u_tex, uv);
 }
 """
+
+DOT_VERT = """
+#version 330
+in vec2 grid_pos;
+in vec3 color;
+uniform vec2  u_center;
+uniform float u_ppi;
+uniform vec2  u_screen;
+out vec3 v_color;
+void main() {
+    vec2 center = grid_pos + 0.5;
+    vec2 sp = (center - u_center) * u_ppi + u_screen * 0.5;
+    sp.y = u_screen.y - sp.y;
+    vec2 ndc = sp / u_screen * 2.0 - 1.0;
+    gl_Position = vec4(ndc, 0.0, 1.0);
+    gl_PointSize = clamp(u_ppi * 0.4, 6.0, 32.0);
+    v_color = color;
+}
+"""
+
+DOT_FRAG = """
+#version 330
+in vec3 v_color;
+out vec4 frag;
+void main() {
+    vec2 c = gl_PointCoord - 0.5;
+    if (dot(c, c) > 0.25) discard;
+    frag = vec4(v_color, 1.0);
+}
+"""
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(req.full_url, code, msg, headers, fp)
 
 
 # ── Hilbert avg-grid cache ────────────────────────────────────────────
@@ -355,8 +417,41 @@ class Viewer:
             self._overlay_prog,
             [(self.ctx.buffer(overlay_quad), '2f', 'pos')])
 
-        print(f"Hilbert grid {SIDE}×{SIDE} (order {ORDER}) = {NUM_IMAGES:,} images")
-        print("Scroll=zoom  Drag=pan  F=fullscreen  M=metadata  Esc=windowed/quit  /=search  Q=quit")
+        # ── link checking ──
+        self._link_lock = threading.Lock()
+        self._link_pool = concurrent.futures.ThreadPoolExecutor(max_workers=64)
+        self._link_dirty = False
+        self._click_sx = 0.0
+        self._click_sy = 0.0
+        self._show_dots = True
+
+        # persistent link status (mmap'd byte array)
+        if not os.path.exists(LINK_CACHE):
+            fp = np.memmap(LINK_CACHE, dtype='uint8', mode='w+',
+                           shape=(NUM_IMAGES,))
+            del fp
+        self._link_status = np.memmap(LINK_CACHE, dtype='uint8', mode='r+',
+                                      shape=(NUM_IMAGES,))
+        self._link_checks = {}
+        checked = np.nonzero(self._link_status)[0]
+        for i in checked:
+            self._link_checks[int(i)] = STATUS_NAMES.get(
+                int(self._link_status[i]), 'error')
+        if checked.size:
+            print(f"Restored {checked.size:,} link checks from cache",
+                  flush=True)
+
+        # fetched image overlay
+        self._fetched_queue = []      # [(idx, gx, gy, pixels), ...] from workers
+        self._fetched_lock = threading.Lock()
+        self._fetched_textures = {}   # idx → (texture, gx, gy)
+
+        # dot shader
+        self._dot_prog = self.ctx.program(
+            vertex_shader=DOT_VERT, fragment_shader=DOT_FRAG)
+
+        print(f"Hilbert grid {SIDE}×{SIDE} (order {ORDER}) = {NUM_IMAGES:,} images", flush=True)
+        print("Scroll=zoom  Drag=pan  Click=check link  F=fullscreen  M=metadata  L=dots  Esc=windowed/quit  /=search  Q=quit", flush=True)
 
     # ── properties ────────────────────────────────────────────────────
     @property
@@ -506,6 +601,82 @@ class Viewer:
             parts.append(hover)
         glfw.set_window_title(self.win, "  |  ".join(parts))
 
+    # ── link checking ────────────────────────────────────────────────
+    def _enqueue_link_check(self, idx):
+        """Queue a HEAD request for the source URL of image *idx*."""
+        with self._link_lock:
+            if idx in self._link_checks:
+                return
+            self._link_checks[idx] = 'pending'
+        self._dirty = True
+        self._link_pool.submit(self._check_link, idx)
+
+    def _check_link(self, idx):
+        """HEAD-request the source URL and classify the result (runs in thread pool)."""
+        meta = self._read_meta(idx)
+        url = meta['source_url'].strip('\x00 ')
+        if not url:
+            status = 'no_url'
+        else:
+            if not url.startswith(('http://', 'https://')):
+                url = 'http://' + url
+            try:
+                req = urllib.request.Request(url, method='HEAD')
+                opener = urllib.request.build_opener(_NoRedirectHandler)
+                resp = opener.open(req, timeout=LINK_TIMEOUT)
+                code = resp.getcode()
+                status = 'ok' if 200 <= code < 300 else 'error'
+            except urllib.error.HTTPError as e:
+                if e.code in (301, 302, 307, 308):
+                    status = 'moved'
+                elif e.code == 404:
+                    status = 'not_found'
+                else:
+                    status = 'error'
+            except socket.gaierror:
+                status = 'dns'
+            except Exception:
+                status = 'error'
+        with self._link_lock:
+            self._link_checks[idx] = status
+            self._link_status[idx] = STATUS_CODES.get(status, 5)
+        self._link_dirty = True
+        if status == 'ok':
+            self._fetch_image(idx, url)
+
+    def _fetch_image(self, idx, url):
+        """GET the image at *url*, center-crop square, and queue for GPU upload."""
+        try:
+            print(f"  fetch #{idx} GET {url[:80]}", flush=True)
+            req = urllib.request.Request(
+                url, headers={'User-Agent': 'TinyImagesViewer/1.0'})
+            resp = urllib.request.urlopen(req, timeout=LINK_TIMEOUT)
+            ctype = resp.headers.get('Content-Type', '')
+            if not ctype.startswith('image/'):
+                print(f"  fetch #{idx} not image: {ctype}", flush=True)
+                with self._link_lock:
+                    self._link_checks[idx] = 'not_image'
+                    self._link_status[idx] = STATUS_CODES['not_image']
+                self._link_dirty = True
+                return
+            raw = resp.read(16 * 1024 * 1024)  # 16 MB cap
+            print(f"  fetch #{idx} got {len(raw)} bytes", flush=True)
+            img = Image.open(io.BytesIO(raw)).convert('RGB')
+            w, h = img.size
+            s = min(w, h)
+            left, top = (w - s) // 2, (h - s) // 2
+            img = img.crop((left, top, left + s, top + s))
+            if s > FETCH_MAX_SIZE:
+                img = img.resize((FETCH_MAX_SIZE, FETCH_MAX_SIZE), Image.LANCZOS)
+            pixels = np.asarray(img, dtype='uint8').copy()
+            print(f"  fetch #{idx} image {w}x{h} → {pixels.shape}", flush=True)
+            gx, gy = hilbert_d2xy(ORDER, np.int64(idx))
+            with self._fetched_lock:
+                self._fetched_queue.append((idx, int(gx), int(gy), pixels))
+            self._link_dirty = True
+        except Exception as e:
+            print(f"  fetch #{idx} FAILED: {e}", flush=True)
+
     # ── input callbacks ───────────────────────────────────────────────
     def _on_scroll(self, win, _dx, dy):
         mx, my = glfw.get_cursor_pos(win)
@@ -526,9 +697,18 @@ class Viewer:
 
     def _on_button(self, win, btn, action, _mods):
         if btn == glfw.MOUSE_BUTTON_LEFT:
-            self.dragging = (action == glfw.PRESS)
-            if self.dragging:
+            if action == glfw.PRESS:
+                self.dragging = True
                 self.mx, self.my = glfw.get_cursor_pos(win)
+                self._click_sx, self._click_sy = self.mx, self.my
+            elif action == glfw.RELEASE:
+                self.dragging = False
+                rx, ry = glfw.get_cursor_pos(win)
+                dx, dy = rx - self._click_sx, ry - self._click_sy
+                if dx * dx + dy * dy < 9:
+                    idx = self._screen_to_image_idx(rx, ry)
+                    if idx >= 0:
+                        self._enqueue_link_check(idx)
 
     def _on_cursor(self, win, x, y):
         if self.dragging:
@@ -591,6 +771,9 @@ class Viewer:
             self._toggle_fullscreen()
         elif key == glfw.KEY_M:
             self._show_meta = not self._show_meta
+            self._dirty = True
+        elif key == glfw.KEY_L:
+            self._show_dots = not self._show_dots
             self._dirty = True
 
     # ── fullscreen ───────────────────────────────────────────────────
@@ -777,6 +960,24 @@ class Viewer:
         self._det_key = key
         return True
 
+    def _upload_pending_fetches(self):
+        """Upload queued fetched images as GPU textures (main thread only)."""
+        with self._fetched_lock:
+            queue = list(self._fetched_queue)
+            self._fetched_queue.clear()
+        if not queue:
+            return False
+        for idx, gx, gy, pixels in queue:
+            h, w = pixels.shape[:2]
+            tex = self.ctx.texture((w, h), 3, pixels.tobytes())
+            tex.build_mipmaps()
+            tex.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
+            if idx in self._fetched_textures:
+                self._fetched_textures[idx][0].release()
+            self._fetched_textures[idx] = (tex, gx, gy)
+            print(f"  uploaded #{idx} tex {w}x{h} at grid ({gx},{gy})", flush=True)
+        return True
+
     # ── render ────────────────────────────────────────────────────────
     def _render(self):
         """Render immediately with whatever detail texture is cached."""
@@ -807,6 +1008,25 @@ class Viewer:
 
         self.vao.render(moderngl.TRIANGLE_STRIP)
 
+        # ── fetched image overlays ──
+        if self._show_dots and self._fetched_textures and self.ppi >= FETCH_MIN_PPI:
+            ppi = self.ppi
+            for idx, (tex, gx, gy) in self._fetched_textures.items():
+                sx0 = (gx - self.cx) * ppi + self.w / 2
+                sy0 = (gy - self.cy) * ppi + self.h / 2
+                sx1 = sx0 + ppi
+                sy1 = sy0 + ppi
+                if sx1 < 0 or sx0 > self.w or sy1 < 0 or sy0 > self.h:
+                    continue
+                x0 = 2.0 * sx0 / self.w - 1.0
+                x1 = 2.0 * sx1 / self.w - 1.0
+                y0 = 1.0 - 2.0 * sy1 / self.h
+                y1 = 1.0 - 2.0 * sy0 / self.h
+                tex.use(0)
+                self._overlay_prog['u_tex'].value = 0
+                self._overlay_prog['u_rect'].value = (x0, y0, x1, y1)
+                self._overlay_vao.render(moderngl.TRIANGLE_STRIP)
+
         # ── metadata overlay ──
         if self._show_meta and self._hover_idx >= 0:
             self._render_meta_texture(self._hover_idx)
@@ -834,6 +1054,32 @@ class Viewer:
                 self._overlay_vao.render(moderngl.TRIANGLE_STRIP)
                 self.ctx.disable(moderngl.BLEND)
 
+        # ── link-check dots ──
+        if self._show_dots and self._link_checks:
+            with self._link_lock:
+                checks = dict(self._link_checks)
+            n = len(checks)
+            indices = np.array(list(checks.keys()), dtype=np.int64)
+            gx, gy = hilbert_d2xy(ORDER, indices)
+            vdata = np.empty((n, 5), dtype='f4')
+            vdata[:, 0] = gx.astype('f4')
+            vdata[:, 1] = gy.astype('f4')
+            for i, idx in enumerate(checks):
+                vdata[i, 2:5] = DOT_COLORS.get(checks[idx], (0.5, 0.5, 0.5))
+            buf = self.ctx.buffer(vdata.tobytes())
+            vao = self.ctx.vertex_array(
+                self._dot_prog, [(buf, '2f 3f', 'grid_pos', 'color')])
+            self.ctx.enable(moderngl.BLEND | moderngl.PROGRAM_POINT_SIZE)
+            self.ctx.blend_func = (
+                moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
+            self._dot_prog['u_center'].value = (self.cx, self.cy)
+            self._dot_prog['u_ppi'].value = self.ppi
+            self._dot_prog['u_screen'].value = (float(self.w), float(self.h))
+            vao.render(moderngl.POINTS)
+            self.ctx.disable(moderngl.BLEND | moderngl.PROGRAM_POINT_SIZE)
+            vao.release()
+            buf.release()
+
     # ── main loop ─────────────────────────────────────────────────────
     def run(self):
         try:
@@ -846,6 +1092,13 @@ class Viewer:
                 # Pick up completed background build
                 if self._upload_pending_detail():
                     self._dirty = True          # re-render with fresh detail
+
+                if self._link_dirty:
+                    self._link_dirty = False
+                    self._dirty = True
+
+                if self._upload_pending_fetches():
+                    self._dirty = True
 
                 # Kick off background build if needed
                 feasible = self._detail_feasible()
@@ -861,6 +1114,8 @@ class Viewer:
                 building = self._bg_thread and self._bg_thread.is_alive()
                 glfw.wait_events_timeout(0.01 if building else 0.05)
         finally:
+            self._link_status.flush()
+            self._link_pool.shutdown(wait=False, cancel_futures=True)
             glfw.terminate()
 
 
