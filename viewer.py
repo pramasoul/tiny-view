@@ -14,6 +14,7 @@ Controls:
   L          toggle link-check dots and fetched overlays
   C          toggle Hilbert crawl from hovered image
   D          dim all except fetched images (find live sources)
+  R          re-fetch all ok images (restore hi-res after restart)
 """
 
 import math, os, signal, sys, time, threading
@@ -468,7 +469,7 @@ class Viewer:
             vertex_shader=DOT_VERT, fragment_shader=DOT_FRAG)
 
         print(f"Hilbert grid {SIDE}×{SIDE} (order {ORDER}) = {NUM_IMAGES:,} images", flush=True)
-        print("Scroll=zoom  Drag=pan  Click=check  C=crawl  D=dim  F=full  M=meta  L=dots  /=search  Esc/Q=quit", flush=True)
+        print("Scroll=zoom  Drag=pan  Click=check  C=crawl  D=dim  R=reload  F=full  M=meta  L=dots  /=search  Esc/Q=quit", flush=True)
 
     # ── properties ────────────────────────────────────────────────────
     @property
@@ -694,6 +695,22 @@ class Viewer:
         except Exception as e:
             print(f"  fetch #{idx} FAILED: {e}", flush=True)
 
+    def _reload_ok_images(self):
+        """Re-fetch all 'ok' images from their source URLs."""
+        ok_indices = [i for i, s in self._link_checks.items()
+                      if s == 'ok' and i not in self._fetched_textures]
+        if not ok_indices:
+            print("No ok images to reload", flush=True)
+            return
+        print(f"Reloading {len(ok_indices)} ok images …", flush=True)
+        for idx in ok_indices:
+            meta = self._read_meta(idx)
+            url = meta['source_url'].strip('\x00 ')
+            if url:
+                if not url.startswith(('http://', 'https://')):
+                    url = 'http://' + url
+                self._link_pool.submit(self._fetch_image, idx, url)
+
     # ── Hilbert crawl ────────────────────────────────────────────────
     def _crawl_worker(self, start_idx, direction):
         """Walk the Hilbert curve from start_idx, direction = +1 or -1."""
@@ -846,6 +863,9 @@ class Viewer:
             self._dirty = True
         elif key == glfw.KEY_D:
             self._dim_mode = not self._dim_mode
+            self._dirty = True
+        elif key == glfw.KEY_R:
+            self._reload_ok_images()
             self._dirty = True
 
     # ── fullscreen ───────────────────────────────────────────────────
