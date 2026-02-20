@@ -702,8 +702,9 @@ class Viewer:
 
     def _reload_ok_images(self):
         """Re-fetch all 'ok' images from their source URLs."""
-        ok_indices = [i for i, s in self._link_checks.items()
-                      if s == 'ok' and i not in self._fetched_textures]
+        with self._link_lock:
+            ok_indices = [i for i, s in self._link_checks.items()
+                          if s == 'ok' and i not in self._fetched_textures]
         if not ok_indices:
             print("No ok images to reload", flush=True)
             return
@@ -1108,8 +1109,9 @@ class Viewer:
 
         # ── undimmed ok cells (when dimmed + zoomed out past hi-res) ──
         if self._dim_mode and self.ppi < FETCH_MIN_PPI:
-            ok_indices = [i for i, s in self._link_checks.items()
-                          if s == 'ok']
+            with self._link_lock:
+                ok_indices = [i for i, s in self._link_checks.items()
+                              if s == 'ok']
             if ok_indices:
                 ok_arr = np.array(ok_indices, dtype=np.int64)
                 gx, gy = hilbert_d2xy(ORDER, ok_arr)
