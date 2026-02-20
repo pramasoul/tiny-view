@@ -492,10 +492,20 @@ class Viewer:
             print(f"Fetched image cache: {cached} images in {len(shard_files)} shard(s)",
                   flush=True)
 
-        # fetched image overlay
+        # fetched image overlay (viewport-scoped GPU textures)
         self._fetched_queue = []      # [(idx, gx, gy, pixels), ...] from workers
         self._fetched_lock = threading.Lock()
-        self._fetched_textures = {}   # idx → (texture, gx, gy)
+        self._fetched_textures = {}   # idx → (texture, gx, gy) — only visible
+        self._fetched_loading = set() # idx currently being loaded from cache
+        # index of all cached images: idx → (gx, gy)
+        all_cached = [r[0] for r in self._fetch_db.execute('SELECT idx FROM images')]
+        if all_cached:
+            arr = np.array(all_cached, dtype=np.int64)
+            gx, gy = hilbert_d2xy(ORDER, arr)
+            self._fetched_index = {int(i): (int(x), int(y))
+                                   for i, x, y in zip(all_cached, gx, gy)}
+        else:
+            self._fetched_index = {}
 
         # dot shader
         self._dot_prog = self.ctx.program(
@@ -1143,23 +1153,60 @@ class Viewer:
         self._det_key = key
         return True
 
+    def _visible_rect(self, margin=2):
+        """Return (gx0, gy0, gx1, gy1) of visible grid cells with margin."""
+        ppi = self.ppi
+        hw, hh = self.w / (2 * ppi), self.h / (2 * ppi)
+        return (int(self.cx - hw) - margin, int(self.cy - hh) - margin,
+                int(self.cx + hw) + margin + 1, int(self.cy + hh) + margin + 1)
+
     def _upload_pending_fetches(self):
-        """Upload queued fetched images as GPU textures (main thread only)."""
+        """Upload queued fetched images — only if visible, else just index them."""
         with self._fetched_lock:
             queue = list(self._fetched_queue)
             self._fetched_queue.clear()
         if not queue:
             return False
+        gx0, gy0, gx1, gy1 = self._visible_rect()
+        show = self.ppi >= FETCH_MIN_PPI
+        uploaded = False
         for idx, gx, gy, pixels in queue:
-            h, w = pixels.shape[:2]
-            tex = self.ctx.texture((w, h), 3, pixels.tobytes())
-            tex.build_mipmaps()
-            tex.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
-            if idx in self._fetched_textures:
+            self._fetched_index[idx] = (gx, gy)
+            self._fetched_loading.discard(idx)
+            if show and gx0 <= gx <= gx1 and gy0 <= gy <= gy1:
+                h, w = pixels.shape[:2]
+                tex = self.ctx.texture((w, h), 3, pixels.tobytes())
+                tex.build_mipmaps()
+                tex.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
+                if idx in self._fetched_textures:
+                    self._fetched_textures[idx][0].release()
+                self._fetched_textures[idx] = (tex, gx, gy)
+                uploaded = True
+        return uploaded
+
+    def _manage_fetched_textures(self):
+        """Evict off-screen textures, load visible cached images."""
+        if self.ppi < FETCH_MIN_PPI:
+            if self._fetched_textures:
+                for tex, _gx, _gy in self._fetched_textures.values():
+                    tex.release()
+                self._fetched_textures.clear()
+                self._dirty = True
+            return
+        gx0, gy0, gx1, gy1 = self._visible_rect()
+        # evict off-screen
+        for idx in list(self._fetched_textures):
+            _, gx, gy = self._fetched_textures[idx]
+            if not (gx0 <= gx <= gx1 and gy0 <= gy <= gy1):
                 self._fetched_textures[idx][0].release()
-            self._fetched_textures[idx] = (tex, gx, gy)
-            print(f"  uploaded #{idx} tex {w}x{h} at grid ({gx},{gy})", flush=True)
-        return True
+                del self._fetched_textures[idx]
+        # load visible cached images that lack textures
+        for idx, (gx, gy) in self._fetched_index.items():
+            if (gx0 <= gx <= gx1 and gy0 <= gy <= gy1
+                    and idx not in self._fetched_textures
+                    and idx not in self._fetched_loading):
+                self._fetched_loading.add(idx)
+                self._link_pool.submit(self._reload_one, idx)
 
     # ── render ────────────────────────────────────────────────────────
     def _render(self):
@@ -1318,6 +1365,8 @@ class Viewer:
 
                 if self._upload_pending_fetches():
                     self._dirty = True
+
+                self._manage_fetched_textures()
 
                 # Kick off background build if needed
                 feasible = self._detail_feasible()
