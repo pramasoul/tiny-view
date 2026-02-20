@@ -248,6 +248,7 @@ in vec3 color;
 uniform vec2  u_center;
 uniform float u_ppi;
 uniform vec2  u_screen;
+uniform int   u_square;
 out vec3 v_color;
 void main() {
     vec2 center = grid_pos + 0.5;
@@ -255,7 +256,8 @@ void main() {
     sp.y = u_screen.y - sp.y;
     vec2 ndc = sp / u_screen * 2.0 - 1.0;
     gl_Position = vec4(ndc, 0.0, 1.0);
-    gl_PointSize = clamp(u_ppi * 0.4, 6.0, 32.0);
+    gl_PointSize = u_square == 1 ? clamp(u_ppi, 1.0, 64.0)
+                                 : clamp(u_ppi * 0.4, 6.0, 32.0);
     v_color = color;
 }
 """
@@ -263,10 +265,13 @@ void main() {
 DOT_FRAG = """
 #version 330
 in vec3 v_color;
+uniform int u_square;
 out vec4 frag;
 void main() {
-    vec2 c = gl_PointCoord - 0.5;
-    if (dot(c, c) > 0.25) discard;
+    if (u_square == 0) {
+        vec2 c = gl_PointCoord - 0.5;
+        if (dot(c, c) > 0.25) discard;
+    }
     frag = vec4(v_color, 1.0);
 }
 """
@@ -1101,6 +1106,35 @@ class Viewer:
 
         self.vao.render(moderngl.TRIANGLE_STRIP)
 
+        # ── undimmed ok cells (when dimmed + zoomed out past hi-res) ──
+        if self._dim_mode and self.ppi < FETCH_MIN_PPI:
+            ok_indices = [i for i, s in self._link_checks.items()
+                          if s == 'ok']
+            if ok_indices:
+                ok_arr = np.array(ok_indices, dtype=np.int64)
+                gx, gy = hilbert_d2xy(ORDER, ok_arr)
+                # avg color from raw data: (N, CH, H, W) → mean over H,W → BGR→RGB
+                raw_avg = self.data[ok_arr].reshape(len(ok_arr), CH, -1).mean(axis=2)
+                vdata = np.empty((len(ok_arr), 5), dtype='f4')
+                vdata[:, 0] = gx.astype('f4')
+                vdata[:, 1] = gy.astype('f4')
+                vdata[:, 2] = raw_avg[:, 2] / 255.0  # R (was B)
+                vdata[:, 3] = raw_avg[:, 1] / 255.0  # G
+                vdata[:, 4] = raw_avg[:, 0] / 255.0  # B (was R)
+                buf = self.ctx.buffer(vdata.tobytes())
+                vao = self.ctx.vertex_array(
+                    self._dot_prog, [(buf, '2f 3f', 'grid_pos', 'color')])
+                self.ctx.enable(moderngl.PROGRAM_POINT_SIZE)
+                self._dot_prog['u_center'].value = (self.cx, self.cy)
+                self._dot_prog['u_ppi'].value = self.ppi
+                self._dot_prog['u_screen'].value = (float(self.w), float(self.h))
+                self._dot_prog['u_square'].value = 1
+                vao.render(moderngl.POINTS)
+                self.ctx.disable(moderngl.PROGRAM_POINT_SIZE)
+                self._dot_prog['u_square'].value = 0
+                vao.release()
+                buf.release()
+
         # ── fetched image overlays ──
         if self._fetched_textures and self.ppi >= FETCH_MIN_PPI:
             ppi = self.ppi
@@ -1168,6 +1202,7 @@ class Viewer:
             self._dot_prog['u_center'].value = (self.cx, self.cy)
             self._dot_prog['u_ppi'].value = self.ppi
             self._dot_prog['u_screen'].value = (float(self.w), float(self.h))
+            self._dot_prog['u_square'].value = 0
             vao.render(moderngl.POINTS)
             self.ctx.disable(moderngl.BLEND | moderngl.PROGRAM_POINT_SIZE)
             vao.release()
