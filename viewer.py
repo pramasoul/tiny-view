@@ -491,6 +491,7 @@ class Viewer:
         self._fetch_db.commit()
         self._shard_lock = threading.Lock()
         self._shard_dirty = 0
+        self._shard_tf = None   # persistent tarfile handle
         shard_files = sorted(
             f for f in os.listdir(FETCH_DIR)
             if f.startswith('shard_') and f.endswith('.tar'))
@@ -760,6 +761,15 @@ class Viewer:
         except Exception as e:
             print(f"  fetch #{idx} FAILED: {e}", flush=True)
 
+    def _open_shard(self):
+        """Open (or reopen) the current shard tar for appending."""
+        if self._shard_tf is not None:
+            self._shard_tf.close()
+        shard = f"shard_{self._shard_num:06d}.tar"
+        path = os.path.join(FETCH_DIR, shard)
+        self._shard_tf = tarfile.open(path, 'a')
+        return shard
+
     def _save_fetched(self, idx, img):
         """Save a fetched PIL image to the current tar shard."""
         try:
@@ -771,14 +781,18 @@ class Viewer:
                 img.save(jpeg_buf, format='JPEG', quality=90)
                 jpeg_data = jpeg_buf.getvalue()
                 w, h = img.size
-                shard = f"shard_{self._shard_num:06d}.tar"
-                shard_path = os.path.join(FETCH_DIR, shard)
-                with tarfile.open(shard_path, 'a') as tf:
-                    info = tarfile.TarInfo(name=f"{idx:010d}.jpg")
-                    info.size = len(jpeg_data)
-                    tf.addfile(info, io.BytesIO(jpeg_data))
-                if os.path.getsize(shard_path) >= FETCH_SHARD_MAX:
+                if self._shard_tf is None:
+                    shard = self._open_shard()
+                else:
+                    shard = f"shard_{self._shard_num:06d}.tar"
+                info = tarfile.TarInfo(name=f"{idx:010d}.jpg")
+                info.size = len(jpeg_data)
+                self._shard_tf.addfile(info, io.BytesIO(jpeg_data))
+                # Check shard size, rotate if needed
+                pos = self._shard_tf.fileobj.tell()
+                if pos >= FETCH_SHARD_MAX:
                     self._shard_num += 1
+                    shard = self._open_shard()
                 self._fetch_db.execute(
                     'INSERT INTO images (idx, shard, width, height) VALUES (?,?,?,?)',
                     (idx, shard, w, h))
@@ -1453,6 +1467,8 @@ class Viewer:
         finally:
             self._stop_crawl()
             self._link_status.flush()
+            if self._shard_tf is not None:
+                self._shard_tf.close()
             self._fetch_db.commit()
             self._fetch_db.close()
             self._link_pool.shutdown(wait=False, cancel_futures=True)
