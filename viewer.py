@@ -13,9 +13,10 @@ Controls:
   Click      check source URL (shows colored dot)
   L          toggle link-check dots and fetched overlays
   C          toggle Hilbert crawl from hovered image
+  D          dim all except fetched images (find live sources)
 """
 
-import math, os, sys, time, threading
+import math, os, signal, sys, time, threading
 import concurrent.futures
 import io
 import socket
@@ -142,6 +143,7 @@ uniform sampler2D u_detail;  // detail texture           (vis_w*32 x vis_h*32)
 uniform vec2  u_det_org;     // grid origin of detail region
 uniform vec2  u_det_sz;      // grid extent of detail region (images)
 uniform int   u_has_det;     // 1 when detail texture is valid
+uniform float u_dim;         // 0.0 = full brightness, >0 darkens output
 
 out vec4 frag;
 
@@ -202,6 +204,7 @@ void main() {
             } else {
                 frag = texture(u_detail, uv);
             }
+            frag.rgb *= (1.0 - u_dim);
             return;
         }
     }
@@ -209,6 +212,7 @@ void main() {
     // ── average-colour path ──
     vec2 uv = (vec2(cell) + 0.5) / u_grid;
     frag = texture(u_avg, uv);
+    frag.rgb *= (1.0 - u_dim);
 }
 """
 
@@ -434,7 +438,9 @@ class Viewer:
         self._link_status = np.memmap(LINK_CACHE, dtype='uint8', mode='r+',
                                       shape=(NUM_IMAGES,))
         self._link_checks = {}
-        checked = np.nonzero(self._link_status)[0]
+        snapshot = np.array(self._link_status)   # copy — nonzero on mmap can race
+        checked = np.nonzero(snapshot)[0]
+        del snapshot
         for i in checked:
             self._link_checks[int(i)] = STATUS_NAMES.get(
                 int(self._link_status[i]), 'error')
@@ -448,6 +454,9 @@ class Viewer:
         self._crawl_origin = -1
         self._crawl_count = [0, 0]    # [forward, backward]
 
+        # dim mode — darken everything except fetched overlays
+        self._dim_mode = False
+
         # fetched image overlay
         self._fetched_queue = []      # [(idx, gx, gy, pixels), ...] from workers
         self._fetched_lock = threading.Lock()
@@ -458,7 +467,7 @@ class Viewer:
             vertex_shader=DOT_VERT, fragment_shader=DOT_FRAG)
 
         print(f"Hilbert grid {SIDE}×{SIDE} (order {ORDER}) = {NUM_IMAGES:,} images", flush=True)
-        print("Scroll=zoom  Drag=pan  Click=check link  C=crawl  F=fullscreen  M=metadata  L=dots  Esc=windowed/quit  /=search  Q=quit", flush=True)
+        print("Scroll=zoom  Drag=pan  Click=check  C=crawl  D=dim  F=full  M=meta  L=dots  /=search  Esc/Q=quit", flush=True)
 
     # ── properties ────────────────────────────────────────────────────
     @property
@@ -825,6 +834,9 @@ class Viewer:
                 if idx >= 0:
                     self._start_crawl(idx)
             self._dirty = True
+        elif key == glfw.KEY_D:
+            self._dim_mode = not self._dim_mode
+            self._dirty = True
 
     # ── fullscreen ───────────────────────────────────────────────────
     def _toggle_fullscreen(self):
@@ -1055,6 +1067,7 @@ class Viewer:
         self.prog['u_ppi'].value    = self.ppi
         self.prog['u_screen'].value = (float(self.w), float(self.h))
         self.prog['u_grid'].value   = (float(SIDE), float(SIDE))
+        self.prog['u_dim'].value    = 0.85 if self._dim_mode else 0.0
 
         self.vao.render(moderngl.TRIANGLE_STRIP)
 
@@ -1132,6 +1145,10 @@ class Viewer:
 
     # ── main loop ─────────────────────────────────────────────────────
     def run(self):
+        # Ctrl+C → graceful shutdown through the finally block
+        def _sigint(sig, frame):
+            glfw.set_window_should_close(self.win, True)
+        signal.signal(signal.SIGINT, _sigint)
         try:
             while not glfw.window_should_close(self.win):
                 if self._dirty:
