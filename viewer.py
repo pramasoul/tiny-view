@@ -5,8 +5,10 @@ Controls:
   Scroll     zoom (toward cursor)
   Drag       pan
   F          toggle fullscreen
+  Escape     windowed (if fullscreen) / quit
+  Q          quit
   Home       reset view
-  Q / Esc    quit
+  /          search keywords (type to search, Esc/Enter to cancel)
 """
 
 import math, os, sys, time, threading
@@ -184,8 +186,13 @@ class Viewer:
         self._bg_lock = threading.Lock()
         self._bg_results = []    # [(key, buf, vw, vh), ...] from bg thread
 
-        # keyword search
-        self._search = ''
+        # keyword search (None = inactive, str = active query)
+        self._search = None
+
+        # fullscreen state
+        self._fullscreen = False
+        self._windowed_pos = (100, 100)
+        self._windowed_size = (self.w, self.h)
 
         # ── GLFW ──
         if not glfw.init():
@@ -241,7 +248,7 @@ class Viewer:
         self._hover_idx = -1      # image index under cursor
 
         print(f"Grid {COLS}×{ROWS} = {NUM_IMAGES:,} images")
-        print("Scroll=zoom  Drag=pan  F=fullscreen  Home=reset  Q=quit")
+        print("Scroll=zoom  Drag=pan  F=fullscreen  Esc=windowed/quit  /=search  Q=quit")
 
     # ── properties ────────────────────────────────────────────────────
     @property
@@ -278,8 +285,7 @@ class Viewer:
 
     def _update_title(self, sx, sy):
         hover = self._hover_text(sx, sy)
-        if self._search:
-            # show both search and hover
+        if self._search is not None:
             parts = [f"/{self._search}"]
             if hover:
                 parts.append(hover)
@@ -313,7 +319,7 @@ class Viewer:
         self._dirty = True
 
     def _update_search(self):
-        if not self._search:
+        if self._search is None or not self._search:
             mx, my = glfw.get_cursor_pos(self.win)
             self._update_title(mx, my)
             return
@@ -367,9 +373,14 @@ class Viewer:
         self._update_title(x, y)
 
     def _on_char(self, _win, codepoint):
-        ch = chr(codepoint).lower()
+        ch = chr(codepoint)
+        if self._search is None:
+            if ch == '/':
+                self._search = ''
+                self._update_search()
+            return
         if ch.isprintable():
-            self._search += ch
+            self._search += ch.lower()
             self._update_search()
 
     def _on_resize(self, _win, w, h):
@@ -381,38 +392,59 @@ class Viewer:
     def _on_key(self, win, key, _sc, action, _mods):
         if action not in (glfw.PRESS, glfw.REPEAT):
             return
-        # search editing
-        if key == glfw.KEY_BACKSPACE and self._search:
-            self._search = self._search[:-1]
-            self._update_search()
-            return
-        if key in (glfw.KEY_ESCAPE, glfw.KEY_ENTER):
-            if self._search:
-                self._search = ''
+        # search editing (when search is active)
+        if self._search is not None:
+            if key == glfw.KEY_BACKSPACE:
+                if self._search:
+                    self._search = self._search[:-1]
+                else:
+                    self._search = None
                 self._update_search()
                 return
-            if key == glfw.KEY_ESCAPE:
+            if key in (glfw.KEY_ESCAPE, glfw.KEY_ENTER):
+                self._search = None
+                self._update_search()
+                return
+            return  # all other keys go to _on_char for search input
+        # normal keys (not searching)
+        if key == glfw.KEY_ESCAPE:
+            if self._fullscreen:
+                self._leave_fullscreen()
+            else:
                 glfw.set_window_should_close(win, True)
-            return
-        if self._search:
-            return  # other keys ignored while searching
-        # normal keys
-        if key == glfw.KEY_Q:
+        elif key == glfw.KEY_Q:
             glfw.set_window_should_close(win, True)
         elif key == glfw.KEY_HOME:
             self.cx, self.cy = COLS / 2.0, ROWS / 2.0
             self.zoom = self._fit_zoom(self.w, self.h)
             self._dirty = True
         elif key == glfw.KEY_F:
-            mon = glfw.get_primary_monitor()
-            mode = glfw.get_video_mode(mon)
-            if glfw.get_window_monitor(win):
-                glfw.set_window_monitor(win, None, 100, 100, 1920, 1080, 0)
-            else:
-                glfw.set_window_monitor(win, mon, 0, 0,
-                                        mode.size.width, mode.size.height,
-                                        mode.refresh_rate)
-            self._dirty = True
+            self._toggle_fullscreen()
+
+    # ── fullscreen ───────────────────────────────────────────────────
+    def _toggle_fullscreen(self):
+        if self._fullscreen:
+            self._leave_fullscreen()
+        else:
+            self._enter_fullscreen()
+
+    def _enter_fullscreen(self):
+        self._windowed_pos = glfw.get_window_pos(self.win)
+        self._windowed_size = glfw.get_window_size(self.win)
+        mon = glfw.get_primary_monitor()
+        mode = glfw.get_video_mode(mon)
+        glfw.set_window_monitor(self.win, mon, 0, 0,
+                                mode.size.width, mode.size.height,
+                                mode.refresh_rate)
+        self._fullscreen = True
+        self._dirty = True
+
+    def _leave_fullscreen(self):
+        x, y = self._windowed_pos
+        w, h = self._windowed_size
+        glfw.set_window_monitor(self.win, None, x, y, w, h, 0)
+        self._fullscreen = False
+        self._dirty = True
 
     # ── detail texture ────────────────────────────────────────────────
     def _viewport_rect(self):
