@@ -228,6 +228,7 @@ class Viewer:
 
         # background detail builder
         self._bg_thread = None
+        self._bg_cancel = threading.Event()
         self._bg_lock = threading.Lock()
         self._bg_results = []    # [(key, buf, vw, vh), ...] from bg thread
 
@@ -518,7 +519,7 @@ class Viewer:
         return cx0 <= vp[0] and cy0 <= vp[1] and cx1 >= vp[2] and cy1 >= vp[3]
 
     @staticmethod
-    def _build_region(data, gx0, gy0, gx1, gy1):
+    def _build_region(data, gx0, gy0, gx1, gy1, cancel=None):
         """Assemble a pixel buffer for a grid region (Hilbert layout)."""
         vw, vh = gx1 - gx0, gy1 - gy0
         buf = np.full((vh * IMG, vw * IMG, CH), 13, dtype='uint8')
@@ -555,6 +556,8 @@ class Viewer:
 
         # read each contiguous run
         for rs, re in zip(run_starts, run_ends):
+            if cancel is not None and cancel.is_set():
+                return buf, vw, vh
             fi_start = int(file_idx[rs])
             fi_end = int(file_idx[re - 1]) + 1
             chunk = np.array(data[fi_start:fi_end])  # single contiguous read
@@ -574,7 +577,10 @@ class Viewer:
     def _start_detail_build(self):
         """Kick off background thread: viewport first, then full margins."""
         if self._bg_thread and self._bg_thread.is_alive():
-            return
+            self._bg_cancel.set()
+            self._bg_thread.join(timeout=2.0)
+        self._bg_cancel = threading.Event()
+        cancel = self._bg_cancel
 
         ppi = self.ppi
         cx, cy = self.cx, self.cy
@@ -604,10 +610,15 @@ class Viewer:
                 int(cx + hw) + 2, int(cy + hh) + 2)
             if vgx1 > vgx0 and vgy1 > vgy0:
                 buf, vw, vh = Viewer._build_region(
-                    data, vgx0, vgy0, vgx1, vgy1)
+                    data, vgx0, vgy0, vgx1, vgy1, cancel=cancel)
+                if cancel.is_set():
+                    return
                 with self._bg_lock:
                     self._bg_results.append(
                         ((vgx0, vgy0, vgx1, vgy1), buf, vw, vh))
+
+            if cancel.is_set():
+                return
 
             # Phase 2: full margin region
             mw = hw * DETAIL_MARGIN
@@ -617,7 +628,9 @@ class Viewer:
                 int(cx + mw) + 1, int(cy + mh) + 1)
             if mgx1 > mgx0 and mgy1 > mgy0:
                 buf, vw, vh = Viewer._build_region(
-                    data, mgx0, mgy0, mgx1, mgy1)
+                    data, mgx0, mgy0, mgx1, mgy1, cancel=cancel)
+                if cancel.is_set():
+                    return
                 with self._bg_lock:
                     self._bg_results.append(
                         ((mgx0, mgy0, mgx1, mgy1), buf, vw, vh))
