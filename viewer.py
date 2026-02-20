@@ -29,7 +29,8 @@ META_REC = 768          # bytes per metadata record
 META_KW_LEN = 80        # keyword field width
 ORDER = 14
 SIDE = 1 << ORDER          # 16384
-AVG_CACHE = os.path.join(os.path.dirname(FILENAME), 'avg_colors.npy')
+AVG_CACHE  = os.path.join(os.path.dirname(FILENAME), 'avg_colors.npy')
+GRID_CACHE = os.path.join(os.path.dirname(FILENAME), 'hilbert_avg_grid.npy')
 
 
 # ── Hilbert curve (numpy-vectorized) ─────────────────────────────────
@@ -207,27 +208,51 @@ void main() {
 """
 
 
-# ── Average-colour cache ─────────────────────────────────────────────
-def load_or_compute_averages(data):
-    if os.path.exists(AVG_CACHE):
-        print("Loading cached average colours …")
-        return np.load(AVG_CACHE)
+# ── Hilbert avg-grid cache ────────────────────────────────────────────
+def _scatter_avg_to_grid(avg):
+    """Hilbert-scatter per-image avg colours into a SIDE×SIDE×3 grid."""
+    grid = np.full((SIDE, SIDE, 3), 13, dtype='uint8')
+    CHUNK = 4_000_000
+    for i in range(0, NUM_IMAGES, CHUNK):
+        e = min(i + CHUNK, NUM_IMAGES)
+        hx, hy = hilbert_d2xy(ORDER, np.arange(i, e, dtype=np.int64))
+        grid[hy, hx] = avg[i:e]
+    return grid
 
+
+def load_or_build_grid(data):
+    """Load the SIDE×SIDE×3 Hilbert avg-colour grid, building it if needed."""
+    if os.path.exists(GRID_CACHE):
+        print("Loading cached Hilbert avg grid …")
+        return np.load(GRID_CACHE)
+
+    # fast path: build from per-image avg cache (no dataset scan)
+    if os.path.exists(AVG_CACHE):
+        print("Building Hilbert avg grid from avg cache …")
+        avg = np.load(AVG_CACHE)
+        grid = _scatter_avg_to_grid(avg)
+        np.save(GRID_CACHE, grid)
+        print(f"Saved to {GRID_CACHE}")
+        return grid
+
+    # slow path: compute averages from raw dataset
     print("Computing average colours (one-time) …")
     avg = np.empty((NUM_IMAGES, 3), dtype='uint8')
-    chunk = 200_000
+    CHUNK = 200_000
     t0 = time.time()
-    for i in range(0, NUM_IMAGES, chunk):
-        e = min(i + chunk, NUM_IMAGES)
+    for i in range(0, NUM_IMAGES, CHUNK):
+        e = min(i + CHUNK, NUM_IMAGES)
         avg[i:e] = data[i:e].mean(axis=(2, 3)).astype('uint8')
         elapsed = time.time() - t0
         pct = 100 * e / NUM_IMAGES
         eta = elapsed / pct * (100 - pct) if pct > 0 else 0
         print(f"\r  {pct:5.1f}%  ETA {eta:.0f}s", end='', flush=True)
     print()
-    np.save(AVG_CACHE, avg)
-    print(f"Saved to {AVG_CACHE}")
-    return avg
+    print("Scattering into Hilbert grid …")
+    grid = _scatter_avg_to_grid(avg)
+    np.save(GRID_CACHE, grid)
+    print(f"Saved to {GRID_CACHE}")
+    return grid
 
 
 # ── Viewer ────────────────────────────────────────────────────────────
@@ -302,16 +327,7 @@ class Viewer:
         self.data = np.memmap(FILENAME, dtype='uint8', mode='r',
                               shape=(NUM_IMAGES, CH, IMG, IMG))
 
-        avg = load_or_compute_averages(self.data)
-
-        # pack into a SIDE × SIDE RGB texture (Hilbert scatter)
-        print("Building Hilbert avg texture …")
-        avg_grid = np.full((SIDE, SIDE, 3), 13, dtype='uint8')
-        CHUNK = 4_000_000
-        for i in range(0, NUM_IMAGES, CHUNK):
-            e = min(i + CHUNK, NUM_IMAGES)
-            hx, hy = hilbert_d2xy(ORDER, np.arange(i, e, dtype=np.int64))
-            avg_grid[hy, hx] = avg[i:e]
+        avg_grid = load_or_build_grid(self.data)
         self.avg_tex = self.ctx.texture((SIDE, SIDE), 3, avg_grid.tobytes())
         del avg_grid
         self.avg_tex.build_mipmaps()
