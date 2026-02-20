@@ -14,10 +14,10 @@ Controls:
   L          toggle link-check dots and fetched overlays
   C          toggle Hilbert crawl from hovered image
   D          dim all except fetched images (find live sources)
-  R          re-fetch all ok images (restore hi-res after restart)
+  R          reload ok images from cache (or network fallback)
 """
 
-import math, os, signal, sys, time, threading
+import math, os, signal, sqlite3, sys, tarfile, time, threading
 import concurrent.futures
 import io
 import socket
@@ -116,7 +116,9 @@ STATUS_CODES = {
 }
 STATUS_NAMES = {v: k for k, v in STATUS_CODES.items()}
 LINK_CACHE = os.path.join(os.path.dirname(FILENAME), 'link_status.bin')
+FETCH_DIR = os.path.join(os.path.dirname(FILENAME), 'fetched')
 FETCH_MAX_SIZE = 512
+FETCH_SHARD_MAX = 1 << 31             # 2 GB per tar shard
 FETCH_MIN_PPI = 16
 
 # Max detail texture dimension (pixels).  16384 is safe on any modern GPU.
@@ -464,6 +466,32 @@ class Viewer:
         # dim mode — darken everything except fetched overlays
         self._dim_mode = False
 
+        # fetched image cache (tar shards + SQLite index)
+        os.makedirs(FETCH_DIR, exist_ok=True)
+        self._fetch_db = sqlite3.connect(
+            os.path.join(FETCH_DIR, 'index.db'), check_same_thread=False)
+        self._fetch_db.execute('PRAGMA journal_mode=WAL')
+        self._fetch_db.execute('''CREATE TABLE IF NOT EXISTS images (
+            idx INTEGER PRIMARY KEY,
+            shard TEXT NOT NULL,
+            width INTEGER NOT NULL,
+            height INTEGER NOT NULL)''')
+        self._fetch_db.commit()
+        self._shard_lock = threading.Lock()
+        shard_files = sorted(
+            f for f in os.listdir(FETCH_DIR)
+            if f.startswith('shard_') and f.endswith('.tar'))
+        if shard_files:
+            self._shard_num = int(shard_files[-1].split('_')[1].split('.')[0])
+            if os.path.getsize(os.path.join(FETCH_DIR, shard_files[-1])) >= FETCH_SHARD_MAX:
+                self._shard_num += 1
+        else:
+            self._shard_num = 0
+        cached = self._fetch_db.execute('SELECT COUNT(*) FROM images').fetchone()[0]
+        if cached:
+            print(f"Fetched image cache: {cached} images in {len(shard_files)} shard(s)",
+                  flush=True)
+
         # fetched image overlay
         self._fetched_queue = []      # [(idx, gx, gy, pixels), ...] from workers
         self._fetched_lock = threading.Lock()
@@ -691,6 +719,7 @@ class Viewer:
             img = img.crop((left, top, left + s, top + s))
             if s > FETCH_MAX_SIZE:
                 img = img.resize((FETCH_MAX_SIZE, FETCH_MAX_SIZE), Image.LANCZOS)
+            self._save_fetched(idx, img)
             pixels = np.asarray(img, dtype='uint8').copy()
             print(f"  fetch #{idx} image {w}x{h} → {pixels.shape}", flush=True)
             gx, gy = hilbert_d2xy(ORDER, np.int64(idx))
@@ -700,8 +729,69 @@ class Viewer:
         except Exception as e:
             print(f"  fetch #{idx} FAILED: {e}", flush=True)
 
+    def _save_fetched(self, idx, img):
+        """Save a fetched PIL image to the current tar shard."""
+        try:
+            with self._shard_lock:
+                if self._fetch_db.execute(
+                        'SELECT 1 FROM images WHERE idx=?', (idx,)).fetchone():
+                    return
+                jpeg_buf = io.BytesIO()
+                img.save(jpeg_buf, format='JPEG', quality=90)
+                jpeg_data = jpeg_buf.getvalue()
+                w, h = img.size
+                shard = f"shard_{self._shard_num:06d}.tar"
+                shard_path = os.path.join(FETCH_DIR, shard)
+                with tarfile.open(shard_path, 'a') as tf:
+                    info = tarfile.TarInfo(name=f"{idx:010d}.jpg")
+                    info.size = len(jpeg_data)
+                    tf.addfile(info, io.BytesIO(jpeg_data))
+                if os.path.getsize(shard_path) >= FETCH_SHARD_MAX:
+                    self._shard_num += 1
+                self._fetch_db.execute(
+                    'INSERT INTO images (idx, shard, width, height) VALUES (?,?,?,?)',
+                    (idx, shard, w, h))
+                self._fetch_db.commit()
+        except Exception as e:
+            print(f"  cache save #{idx} FAILED: {e}", flush=True)
+
+    def _load_fetched(self, idx):
+        """Load a fetched image from the tar cache. Returns pixels array or None."""
+        row = self._fetch_db.execute(
+            'SELECT shard FROM images WHERE idx=?', (idx,)).fetchone()
+        if row is None:
+            return None
+        shard_path = os.path.join(FETCH_DIR, row[0])
+        if not os.path.exists(shard_path):
+            return None
+        try:
+            with tarfile.open(shard_path, 'r') as tf:
+                data = tf.extractfile(f"{idx:010d}.jpg").read()
+            img = Image.open(io.BytesIO(data)).convert('RGB')
+            return np.asarray(img, dtype='uint8').copy()
+        except Exception as e:
+            print(f"  cache load #{idx} FAILED: {e}", flush=True)
+            return None
+
+    def _reload_one(self, idx):
+        """Load one image from cache or network, queue for GPU upload."""
+        pixels = self._load_fetched(idx)
+        if pixels is None:
+            meta = self._read_meta(idx)
+            url = meta['source_url'].strip('\x00 ')
+            if not url:
+                return
+            if not url.startswith(('http://', 'https://')):
+                url = 'http://' + url
+            self._fetch_image(idx, url)
+            return
+        gx, gy = hilbert_d2xy(ORDER, np.int64(idx))
+        with self._fetched_lock:
+            self._fetched_queue.append((idx, int(gx), int(gy), pixels))
+        self._link_dirty = True
+
     def _reload_ok_images(self):
-        """Re-fetch all 'ok' images from their source URLs."""
+        """Reload all 'ok' images from cache (or network fallback)."""
         with self._link_lock:
             ok_indices = [i for i, s in self._link_checks.items()
                           if s == 'ok' and i not in self._fetched_textures]
@@ -710,12 +800,7 @@ class Viewer:
             return
         print(f"Reloading {len(ok_indices)} ok images …", flush=True)
         for idx in ok_indices:
-            meta = self._read_meta(idx)
-            url = meta['source_url'].strip('\x00 ')
-            if url:
-                if not url.startswith(('http://', 'https://')):
-                    url = 'http://' + url
-                self._link_pool.submit(self._fetch_image, idx, url)
+            self._link_pool.submit(self._reload_one, idx)
 
     # ── Hilbert crawl ────────────────────────────────────────────────
     def _crawl_worker(self, start_idx, direction):
@@ -1256,6 +1341,7 @@ class Viewer:
         finally:
             self._stop_crawl()
             self._link_status.flush()
+            self._fetch_db.close()
             self._link_pool.shutdown(wait=False, cancel_futures=True)
             glfw.terminate()
 
