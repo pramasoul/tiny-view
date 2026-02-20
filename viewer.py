@@ -98,6 +98,7 @@ DETAIL_MIN_PPI = 4 # show detail textures when images are ≥ this many px on sc
 META_OFFSET = (100, 100)  # overlay offset from cursor (right, down) in pixels
 
 LINK_TIMEOUT = 10
+CRAWL_STOP_RUN = 1024  # stop crawl direction after N consecutive already-checked
 DOT_COLORS = {
     'pending':   (1.0, 0.6, 0.0),
     'ok':        (0.0, 0.9, 0.0),
@@ -697,11 +698,20 @@ class Viewer:
     def _crawl_worker(self, start_idx, direction):
         """Walk the Hilbert curve from start_idx, direction = +1 or -1."""
         slot = 0 if direction > 0 else 1
+        label = "fwd" if direction > 0 else "bwd"
         idx = start_idx
+        consec = 0
         while not self._crawl_cancel.is_set():
             idx += direction
             if idx < 0 or idx >= NUM_IMAGES:
                 break
+            if self._link_status[idx]:
+                consec += 1
+                if consec >= CRAWL_STOP_RUN:
+                    print(f"  crawl {label} stopped: {CRAWL_STOP_RUN} consecutive already-checked at #{idx:,}", flush=True)
+                    break
+                continue   # skip already-checked instantly
+            consec = 0
             self._enqueue_link_check(idx)
             self._crawl_count[slot] += 1
             self._crawl_cancel.wait(0.05)
@@ -1072,7 +1082,7 @@ class Viewer:
         self.vao.render(moderngl.TRIANGLE_STRIP)
 
         # ── fetched image overlays ──
-        if self._show_dots and self._fetched_textures and self.ppi >= FETCH_MIN_PPI:
+        if self._fetched_textures and self.ppi >= FETCH_MIN_PPI:
             ppi = self.ppi
             for idx, (tex, gx, gy) in self._fetched_textures.items():
                 sx0 = (gx - self.cx) * ppi + self.w / 2
@@ -1175,6 +1185,11 @@ class Viewer:
                     self._det_tex.release()
                     self._det_tex = None
                     self._det_key = None
+                    self._dirty = True
+
+                # Auto-stop crawl when both directions are done
+                if self._crawl_threads and not any(t.is_alive() for t in self._crawl_threads):
+                    self._stop_crawl()
                     self._dirty = True
 
                 # Poll faster while a build is in flight or crawl is active
