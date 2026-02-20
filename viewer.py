@@ -5,6 +5,7 @@ Controls:
   Scroll     zoom (toward cursor)
   Drag       pan
   F          toggle fullscreen
+  M          toggle metadata overlay for hovered image
   Escape     windowed (if fullscreen) / quit
   Q          quit
   Home       reset view
@@ -15,6 +16,7 @@ import math, os, sys, time, threading
 import numpy as np
 import glfw
 import moderngl
+from PIL import Image, ImageDraw, ImageFont
 
 # ── Dataset constants ────────────────────────────────────────────────
 FILENAME = '/data-pool/tor/tiny/data/tiny_images.bin'
@@ -83,6 +85,7 @@ MIN_ZOOM = -18.0  # whole grid → ~1 px (Powers of Ten)
 MAX_ZOOM =  5.0   # 32 display-px per image-px
 TITLE_ZOOM = -2.0 # show keyword in title bar at this zoom or closer
 DETAIL_MIN_PPI = 4 # show detail textures when images are ≥ this many px on screen
+META_OFFSET = (100, 100)  # overlay offset from cursor (right, down) in pixels
 
 # Max detail texture dimension (pixels).  16384 is safe on any modern GPU.
 MAX_TEX = 16384
@@ -177,6 +180,29 @@ void main() {
     // ── average-colour path ──
     vec2 uv = (vec2(cell) + 0.5) / u_grid;
     frag = texture(u_avg, uv);
+}
+"""
+
+OVERLAY_VERT = """
+#version 330
+in vec2 pos;          // unit quad [0,1]
+uniform vec4 u_rect;  // (x0, y0, x1, y1) in NDC
+out vec2 v_uv;
+void main() {
+    v_uv = pos;
+    vec2 p = mix(u_rect.xy, u_rect.zw, pos);
+    gl_Position = vec4(p, 0.0, 1.0);
+}
+"""
+
+OVERLAY_FRAG = """
+#version 330
+in vec2 v_uv;
+uniform sampler2D u_tex;
+out vec4 frag;
+void main() {
+    vec2 uv = vec2(v_uv.x, 1.0 - v_uv.y);
+    frag = texture(u_tex, uv);
 }
 """
 
@@ -299,8 +325,22 @@ class Viewer:
                               shape=(NUM_IMAGES, META_REC))
         self._hover_idx = -1      # image index under cursor
 
+        # ── metadata overlay ──
+        self._show_meta = False
+        self._meta_tex = None
+        self._meta_idx = -1       # avoid redundant re-renders for same image
+        self._meta_tw = 0         # texture width  (pixels)
+        self._meta_th = 0         # texture height (pixels)
+
+        self._overlay_prog = self.ctx.program(
+            vertex_shader=OVERLAY_VERT, fragment_shader=OVERLAY_FRAG)
+        overlay_quad = np.array([0, 0, 1, 0, 0, 1, 1, 1], dtype='f4')
+        self._overlay_vao = self.ctx.vertex_array(
+            self._overlay_prog,
+            [(self.ctx.buffer(overlay_quad), '2f', 'pos')])
+
         print(f"Hilbert grid {SIDE}×{SIDE} (order {ORDER}) = {NUM_IMAGES:,} images")
-        print("Scroll=zoom  Drag=pan  F=fullscreen  Esc=windowed/quit  /=search  Q=quit")
+        print("Scroll=zoom  Drag=pan  F=fullscreen  M=metadata  Esc=windowed/quit  /=search  Q=quit")
 
     # ── properties ────────────────────────────────────────────────────
     @property
@@ -346,6 +386,65 @@ class Viewer:
             glfw.set_window_title(self.win, hover)
         else:
             glfw.set_window_title(self.win, "Tiny Images")
+
+    # ── metadata overlay ─────────────────────────────────────────────
+    def _read_meta(self, idx):
+        """Parse full metadata record for image *idx* into a dict."""
+        raw = bytes(self.meta[idx])
+        return {
+            'keyword':       raw[  0: 80].decode('ascii', errors='replace').rstrip(),
+            'filename':      raw[ 80:160].decode('ascii', errors='replace').rstrip(),
+            'image_spec':    raw[175:180].decode('ascii', errors='replace').rstrip(),
+            'crawl_date':    raw[180:212].decode('ascii', errors='replace').strip(),
+            'search_engine': raw[212:222].decode('ascii', errors='replace').strip(),
+            'source_url':    raw[422:720].decode('ascii', errors='replace').strip(),
+        }
+
+    def _meta_fixed_width(self):
+        """Return a fixed overlay width (pixels) based on max field widths."""
+        if not hasattr(self, '_meta_fw'):
+            font = ImageFont.load_default(size=16)
+            pad = 8
+            # longest possible line: "url:      " + 80 chars
+            ruler = "url:      " + "W" * 80
+            self._meta_fw = font.getbbox(ruler)[2] + pad * 2
+        return self._meta_fw
+
+    def _render_meta_texture(self, idx):
+        """Render metadata for image *idx* into an RGBA texture."""
+        if idx == self._meta_idx and self._meta_tex is not None:
+            return
+        meta = self._read_meta(idx)
+        lines = [
+            f"#{idx:,}",
+            f"keyword:  {meta['keyword']}",
+            f"file:     {meta['filename']}",
+            f"spec:     {meta['image_spec']}",
+            f"date:     {meta['crawl_date']}",
+            f"engine:   {meta['search_engine']}",
+            f"url:      {meta['source_url'][:80]}",
+        ]
+        font = ImageFont.load_default(size=16)
+        pad = 8
+        line_h = font.getbbox("Ag")[3] + 4
+        tw = self._meta_fixed_width()
+        th = line_h * len(lines) + pad * 2
+
+        img = Image.new('RGBA', (tw, th), (0, 0, 0, 180))
+        draw = ImageDraw.Draw(img)
+        y = pad
+        for ln in lines:
+            draw.text((pad, y), ln, fill=(255, 255, 255, 255), font=font)
+            y += line_h
+
+        buf = img.tobytes()
+        if self._meta_tex is not None:
+            self._meta_tex.release()
+        self._meta_tex = self.ctx.texture((tw, th), 4, buf)
+        self._meta_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
+        self._meta_tw = tw
+        self._meta_th = th
+        self._meta_idx = idx
 
     # ── keyword search ────────────────────────────────────────────────
     def _find_prefix(self, prefix):
@@ -423,6 +522,8 @@ class Viewer:
             self.mx, self.my = x, y
             self._dirty = True
         self._update_title(x, y)
+        if self._show_meta:
+            self._dirty = True
 
     def _on_char(self, _win, codepoint):
         ch = chr(codepoint)
@@ -472,6 +573,9 @@ class Viewer:
             self._dirty = True
         elif key == glfw.KEY_F:
             self._toggle_fullscreen()
+        elif key == glfw.KEY_M:
+            self._show_meta = not self._show_meta
+            self._dirty = True
 
     # ── fullscreen ───────────────────────────────────────────────────
     def _toggle_fullscreen(self):
@@ -686,6 +790,33 @@ class Viewer:
         self.prog['u_grid'].value   = (float(SIDE), float(SIDE))
 
         self.vao.render(moderngl.TRIANGLE_STRIP)
+
+        # ── metadata overlay ──
+        if self._show_meta and self._hover_idx >= 0:
+            self._render_meta_texture(self._hover_idx)
+            if self._meta_tex is not None:
+                mx, my = glfw.get_cursor_pos(self.win)
+                # upper-left of overlay at cursor + offset (screen coords, y-down)
+                ox = mx + META_OFFSET[0]
+                oy = my + META_OFFSET[1]
+                # clamp so overlay stays fully on-screen
+                ox = min(ox, self.w - self._meta_tw)
+                oy = min(oy, self.h - self._meta_th)
+                ox = max(0, ox)
+                oy = max(0, oy)
+                # convert screen coords (y-down) to NDC (y-up)
+                x0 = 2.0 * ox / self.w - 1.0
+                x1 = 2.0 * (ox + self._meta_tw) / self.w - 1.0
+                y0 = 1.0 - 2.0 * (oy + self._meta_th) / self.h
+                y1 = 1.0 - 2.0 * oy / self.h
+                self.ctx.enable(moderngl.BLEND)
+                self.ctx.blend_func = (
+                    moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
+                self._meta_tex.use(0)
+                self._overlay_prog['u_tex'].value = 0
+                self._overlay_prog['u_rect'].value = (x0, y0, x1, y1)
+                self._overlay_vao.render(moderngl.TRIANGLE_STRIP)
+                self.ctx.disable(moderngl.BLEND)
 
     # ── main loop ─────────────────────────────────────────────────────
     def run(self):
