@@ -490,6 +490,7 @@ class Viewer:
             height INTEGER NOT NULL)''')
         self._fetch_db.commit()
         self._shard_lock = threading.Lock()
+        self._shard_dirty = 0
         shard_files = sorted(
             f for f in os.listdir(FETCH_DIR)
             if f.startswith('shard_') and f.endswith('.tar'))
@@ -781,7 +782,10 @@ class Viewer:
                 self._fetch_db.execute(
                     'INSERT INTO images (idx, shard, width, height) VALUES (?,?,?,?)',
                     (idx, shard, w, h))
-                self._fetch_db.commit()
+                self._shard_dirty += 1
+                if self._shard_dirty >= 50:
+                    self._fetch_db.commit()
+                    self._shard_dirty = 0
         except Exception as e:
             print(f"  cache save #{idx} FAILED: {e}", flush=True)
 
@@ -1449,6 +1453,7 @@ class Viewer:
         finally:
             self._stop_crawl()
             self._link_status.flush()
+            self._fetch_db.commit()
             self._fetch_db.close()
             self._link_pool.shutdown(wait=False, cancel_futures=True)
             glfw.terminate()
