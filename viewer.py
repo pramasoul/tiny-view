@@ -12,6 +12,7 @@ Controls:
   /          search keywords (type to search, Esc/Enter to cancel)
   Click      check source URL (shows colored dot)
   L          toggle link-check dots and fetched overlays
+  C          toggle Hilbert crawl from hovered image
 """
 
 import math, os, sys, time, threading
@@ -441,6 +442,12 @@ class Viewer:
             print(f"Restored {checked.size:,} link checks from cache",
                   flush=True)
 
+        # Hilbert crawl state
+        self._crawl_cancel = threading.Event()
+        self._crawl_threads = []
+        self._crawl_origin = -1
+        self._crawl_count = [0, 0]    # [forward, backward]
+
         # fetched image overlay
         self._fetched_queue = []      # [(idx, gx, gy, pixels), ...] from workers
         self._fetched_lock = threading.Lock()
@@ -451,7 +458,7 @@ class Viewer:
             vertex_shader=DOT_VERT, fragment_shader=DOT_FRAG)
 
         print(f"Hilbert grid {SIDE}×{SIDE} (order {ORDER}) = {NUM_IMAGES:,} images", flush=True)
-        print("Scroll=zoom  Drag=pan  Click=check link  F=fullscreen  M=metadata  L=dots  Esc=windowed/quit  /=search  Q=quit", flush=True)
+        print("Scroll=zoom  Drag=pan  Click=check link  C=crawl  F=fullscreen  M=metadata  L=dots  Esc=windowed/quit  /=search  Q=quit", flush=True)
 
     # ── properties ────────────────────────────────────────────────────
     @property
@@ -488,15 +495,15 @@ class Viewer:
 
     def _update_title(self, sx, sy):
         hover = self._hover_text(sx, sy)
+        parts = []
         if self._search is not None:
-            parts = [f"/{self._search}"]
-            if hover:
-                parts.append(hover)
-            glfw.set_window_title(self.win, "  |  ".join(parts))
-        elif hover:
-            glfw.set_window_title(self.win, hover)
-        else:
-            glfw.set_window_title(self.win, "Tiny Images")
+            parts.append(f"/{self._search}")
+        if hover:
+            parts.append(hover)
+        if self._crawl_threads:
+            fwd, bwd = self._crawl_count
+            parts.append(f"Crawling from #{self._crawl_origin:,}... [+{fwd}/-{bwd}]")
+        glfw.set_window_title(self.win, "  |  ".join(parts) if parts else "Tiny Images")
 
     # ── metadata overlay ─────────────────────────────────────────────
     def _read_meta(self, idx):
@@ -677,6 +684,41 @@ class Viewer:
         except Exception as e:
             print(f"  fetch #{idx} FAILED: {e}", flush=True)
 
+    # ── Hilbert crawl ────────────────────────────────────────────────
+    def _crawl_worker(self, start_idx, direction):
+        """Walk the Hilbert curve from start_idx, direction = +1 or -1."""
+        slot = 0 if direction > 0 else 1
+        idx = start_idx
+        while not self._crawl_cancel.is_set():
+            idx += direction
+            if idx < 0 or idx >= NUM_IMAGES:
+                break
+            self._enqueue_link_check(idx)
+            self._crawl_count[slot] += 1
+            self._crawl_cancel.wait(0.05)
+
+    def _start_crawl(self, idx):
+        self._stop_crawl()
+        self._crawl_cancel = threading.Event()
+        self._crawl_origin = idx
+        self._crawl_count = [0, 0]
+        fwd = threading.Thread(target=self._crawl_worker, args=(idx, +1), daemon=True)
+        bwd = threading.Thread(target=self._crawl_worker, args=(idx, -1), daemon=True)
+        self._crawl_threads = [fwd, bwd]
+        fwd.start()
+        bwd.start()
+        print(f"Crawl started from #{idx:,}", flush=True)
+
+    def _stop_crawl(self):
+        if self._crawl_threads:
+            self._crawl_cancel.set()
+            for t in self._crawl_threads:
+                t.join(timeout=1.0)
+            total = sum(self._crawl_count)
+            if total:
+                print(f"Crawl stopped ({total:,} checked)", flush=True)
+            self._crawl_threads = []
+
     # ── input callbacks ───────────────────────────────────────────────
     def _on_scroll(self, win, _dx, dy):
         mx, my = glfw.get_cursor_pos(win)
@@ -774,6 +816,14 @@ class Viewer:
             self._dirty = True
         elif key == glfw.KEY_L:
             self._show_dots = not self._show_dots
+            self._dirty = True
+        elif key == glfw.KEY_C:
+            if self._crawl_threads:
+                self._stop_crawl()
+            else:
+                idx = self._screen_to_image_idx(*glfw.get_cursor_pos(win))
+                if idx >= 0:
+                    self._start_crawl(idx)
             self._dirty = True
 
     # ── fullscreen ───────────────────────────────────────────────────
@@ -1110,10 +1160,12 @@ class Viewer:
                     self._det_key = None
                     self._dirty = True
 
-                # Poll faster while a build is in flight
-                building = self._bg_thread and self._bg_thread.is_alive()
-                glfw.wait_events_timeout(0.01 if building else 0.05)
+                # Poll faster while a build is in flight or crawl is active
+                busy = ((self._bg_thread and self._bg_thread.is_alive())
+                        or self._crawl_threads)
+                glfw.wait_events_timeout(0.01 if busy else 0.05)
         finally:
+            self._stop_crawl()
             self._link_status.flush()
             self._link_pool.shutdown(wait=False, cancel_futures=True)
             glfw.terminate()
