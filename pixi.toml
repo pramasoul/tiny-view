@@ -1,0 +1,17 @@
+[workspace]
+authors = ["Tom Soulanille <soul@prama.com>"]
+channels = ["conda-forge"]
+name = "tiny"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[tasks]
+
+[dependencies]
+python = "3.12.*"
+
+[pypi-dependencies]
+matplotlib = ">=3.10.8, <4"
+numpy = ">=2, <3"
+moderngl = ">=5, <6"
+glfw = ">=2, <3"
