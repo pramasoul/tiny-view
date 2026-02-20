@@ -159,14 +159,20 @@ def load_or_compute_averages(data):
 
 # ── Viewer ────────────────────────────────────────────────────────────
 class Viewer:
+    @staticmethod
+    def _fit_zoom(w, h):
+        """Zoom level that fits the whole grid in 90% of the shorter axis."""
+        ppi = 0.9 * min(w / COLS, h / ROWS)
+        return math.log2(max(ppi, 2 ** (MIN_ZOOM + 5))) - 5
+
     def __init__(self):
         # view state
+        self.w, self.h = 1920, 1080
         self.cx = COLS / 2.0
         self.cy = ROWS / 2.0
-        self.zoom = MIN_ZOOM
+        self.zoom = self._fit_zoom(self.w, self.h)
         self.dragging = False
         self.mx = self.my = 0.0
-        self.w, self.h = 1920, 1080
 
         # detail texture cache
         self._det_key = None
@@ -394,7 +400,8 @@ class Viewer:
         if key == glfw.KEY_Q:
             glfw.set_window_should_close(win, True)
         elif key == glfw.KEY_HOME:
-            self.cx, self.cy, self.zoom = COLS / 2.0, ROWS / 2.0, MIN_ZOOM
+            self.cx, self.cy = COLS / 2.0, ROWS / 2.0
+            self.zoom = self._fit_zoom(self.w, self.h)
             self._dirty = True
         elif key == glfw.KEY_F:
             mon = glfw.get_primary_monitor()
