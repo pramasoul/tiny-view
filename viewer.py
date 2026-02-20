@@ -25,9 +25,59 @@ CH = 3
 BPI = IMG * IMG * CH
 META_REC = 768          # bytes per metadata record
 META_KW_LEN = 80        # keyword field width
-COLS = math.ceil(math.sqrt(NUM_IMAGES))
-ROWS = math.ceil(NUM_IMAGES / COLS)
+ORDER = 14
+SIDE = 1 << ORDER          # 16384
 AVG_CACHE = os.path.join(os.path.dirname(FILENAME), 'avg_colors.npy')
+
+
+# ── Hilbert curve (numpy-vectorized) ─────────────────────────────────
+def hilbert_d2xy(order, d):
+    """Convert Hilbert index *d* → (x, y) on a 2^order grid (vectorized)."""
+    d = np.asarray(d, dtype=np.int64)
+    x = np.zeros_like(d)
+    y = np.zeros_like(d)
+    t = d.copy()
+    s = 1
+    while s < (1 << order):
+        rx = (t >> 1) & 1
+        ry = (t ^ rx) & 1
+        # rotate quadrant
+        swap = (ry == 0)
+        flip = swap & (rx == 1)
+        x_tmp = x.copy()
+        # swap x,y where ry==0
+        np.copyto(x, y, where=swap)
+        np.copyto(y, x_tmp, where=swap)
+        # flip where ry==0 and rx==1
+        np.copyto(x, s - 1 - x, where=flip)
+        np.copyto(y, s - 1 - y, where=flip)
+        x += s * rx
+        y += s * ry
+        t >>= 2
+        s <<= 1
+    return x, y
+
+
+def hilbert_xy2d(order, x, y):
+    """Convert (x, y) → Hilbert index on a 2^order grid (vectorized)."""
+    x = np.array(x, dtype=np.int64, copy=True)
+    y = np.array(y, dtype=np.int64, copy=True)
+    d = np.zeros_like(x)
+    s = (1 << order) >> 1
+    while s > 0:
+        rx = ((x & s) > 0).astype(np.int64)
+        ry = ((y & s) > 0).astype(np.int64)
+        d += s * s * ((3 * rx) ^ ry)
+        # rotate
+        swap = (ry == 0)
+        flip = swap & (rx == 1)
+        x_tmp = x.copy()
+        np.copyto(x, y, where=swap)
+        np.copyto(y, x_tmp, where=swap)
+        np.copyto(x, s - 1 - x, where=flip)
+        np.copyto(y, s - 1 - y, where=flip)
+        s >>= 1
+    return d
 
 MIN_ZOOM = -18.0  # whole grid → ~1 px (Powers of Ten)
 MAX_ZOOM =  5.0   # 32 display-px per image-px
@@ -53,10 +103,9 @@ FRAG = """
 uniform vec2  u_center;      // view centre in grid coords
 uniform float u_ppi;         // display pixels per image
 uniform vec2  u_screen;      // viewport size
-uniform vec2  u_grid;        // (COLS, ROWS)
-uniform int   u_num;         // NUM_IMAGES
+uniform vec2  u_grid;        // (SIDE, SIDE)
 
-uniform sampler2D u_avg;     // average-colour texture  (COLS x ROWS)
+uniform sampler2D u_avg;     // average-colour texture  (SIDE x SIDE)
 uniform sampler2D u_detail;  // detail texture           (vis_w*32 x vis_h*32)
 uniform vec2  u_det_org;     // grid origin of detail region
 uniform vec2  u_det_sz;      // grid extent of detail region (images)
@@ -110,10 +159,6 @@ void main() {
         return;
     }
     ivec2 cell = ivec2(floor(gp));
-    if (cell.y * int(u_grid.x) + cell.x >= u_num) {
-        frag = vec4(0.05, 0.05, 0.05, 1.0);
-        return;
-    }
 
     // ── detail path ──
     if (u_has_det == 1) {
@@ -164,14 +209,14 @@ class Viewer:
     @staticmethod
     def _fit_zoom(w, h):
         """Zoom level that fits the whole grid in 90% of the shorter axis."""
-        ppi = 0.9 * min(w / COLS, h / ROWS)
+        ppi = 0.9 * min(w / SIDE, h / SIDE)
         return math.log2(max(ppi, 2 ** (MIN_ZOOM + 5))) - 5
 
     def __init__(self):
         # view state
         self.w, self.h = 1920, 1080
-        self.cx = COLS / 2.0
-        self.cy = ROWS / 2.0
+        self.cx = SIDE / 2.0
+        self.cy = SIDE / 2.0
         self.zoom = self._fit_zoom(self.w, self.h)
         self.dragging = False
         self.mx = self.my = 0.0
@@ -232,10 +277,16 @@ class Viewer:
 
         avg = load_or_compute_averages(self.data)
 
-        # pack into a ROWS × COLS RGB texture
-        avg_grid = np.zeros((ROWS, COLS, 3), dtype='uint8')
-        avg_grid.reshape(-1, 3)[:NUM_IMAGES] = avg
-        self.avg_tex = self.ctx.texture((COLS, ROWS), 3, avg_grid.tobytes())
+        # pack into a SIDE × SIDE RGB texture (Hilbert scatter)
+        print("Building Hilbert avg texture …")
+        avg_grid = np.full((SIDE, SIDE, 3), 13, dtype='uint8')
+        CHUNK = 4_000_000
+        for i in range(0, NUM_IMAGES, CHUNK):
+            e = min(i + CHUNK, NUM_IMAGES)
+            hx, hy = hilbert_d2xy(ORDER, np.arange(i, e, dtype=np.int64))
+            avg_grid[hy, hx] = avg[i:e]
+        self.avg_tex = self.ctx.texture((SIDE, SIDE), 3, avg_grid.tobytes())
+        del avg_grid
         self.avg_tex.build_mipmaps()
         self.avg_tex.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
 
@@ -247,7 +298,7 @@ class Viewer:
                               shape=(NUM_IMAGES, META_REC))
         self._hover_idx = -1      # image index under cursor
 
-        print(f"Grid {COLS}×{ROWS} = {NUM_IMAGES:,} images")
+        print(f"Hilbert grid {SIDE}×{SIDE} (order {ORDER}) = {NUM_IMAGES:,} images")
         print("Scroll=zoom  Drag=pan  F=fullscreen  Esc=windowed/quit  /=search  Q=quit")
 
     # ── properties ────────────────────────────────────────────────────
@@ -263,9 +314,9 @@ class Viewer:
         gx = self.cx + (sx - self.w / 2) / ppi
         gy = self.cy + (sy - self.h / 2) / ppi
         ix, iy = int(math.floor(gx)), int(math.floor(gy))
-        if ix < 0 or iy < 0 or ix >= COLS or iy >= ROWS:
+        if ix < 0 or iy < 0 or ix >= SIDE or iy >= SIDE:
             return -1
-        idx = iy * COLS + ix
+        idx = int(hilbert_xy2d(ORDER, ix, iy))
         return idx if idx < NUM_IMAGES else -1
 
     def _keyword(self, idx):
@@ -312,8 +363,8 @@ class Viewer:
 
     def _jump_to(self, idx):
         """Centre the view on image *idx*."""
-        gx = idx % COLS
-        gy = idx // COLS
+        gx, gy = hilbert_d2xy(ORDER, np.int64(idx))
+        gx, gy = int(gx), int(gy)
         self.cx = gx + 0.5
         self.cy = gy + 0.5
         self._dirty = True
@@ -415,7 +466,7 @@ class Viewer:
         elif key == glfw.KEY_Q:
             glfw.set_window_should_close(win, True)
         elif key == glfw.KEY_HOME:
-            self.cx, self.cy = COLS / 2.0, ROWS / 2.0
+            self.cx, self.cy = SIDE / 2.0, SIDE / 2.0
             self.zoom = self._fit_zoom(self.w, self.h)
             self._dirty = True
         elif key == glfw.KEY_F:
@@ -468,22 +519,56 @@ class Viewer:
 
     @staticmethod
     def _build_region(data, gx0, gy0, gx1, gy1):
-        """Assemble a pixel buffer for a grid region. Pure CPU work."""
+        """Assemble a pixel buffer for a grid region (Hilbert layout)."""
         vw, vh = gx1 - gx0, gy1 - gy0
-        buf = np.zeros((vh * IMG, vw * IMG, CH), dtype='uint8')
-        for dy in range(vh):
-            gy = gy0 + dy
-            start = gy * COLS + gx0
-            end = min(gy * COLS + gx1, NUM_IMAGES)
-            n = end - start
-            if n <= 0:
-                continue
-            row = np.array(data[start:end])
-            row = row.transpose(0, 2, 3, 1)
-            row = np.rot90(row, k=-1, axes=(1, 2))
-            row = row[:, :, ::-1]
-            strip = row.transpose(1, 0, 2, 3).reshape(IMG, n * IMG, CH)
-            buf[dy * IMG:(dy + 1) * IMG, :n * IMG] = strip
+        buf = np.full((vh * IMG, vw * IMG, CH), 13, dtype='uint8')
+
+        # grid coords for every cell in the region
+        gxs, gys = np.meshgrid(
+            np.arange(gx0, gx1, dtype=np.int64),
+            np.arange(gy0, gy1, dtype=np.int64))
+        gxs = gxs.ravel()
+        gys = gys.ravel()
+
+        # Hilbert index for each cell
+        file_idx = hilbert_xy2d(ORDER, gxs, gys)
+
+        # filter valid
+        valid = file_idx < NUM_IMAGES
+        file_idx = file_idx[valid]
+        gxs = gxs[valid]
+        gys = gys[valid]
+
+        if len(file_idx) == 0:
+            return buf, vw, vh
+
+        # sort by file index for sequential disk access
+        sort_order = np.argsort(file_idx)
+        file_idx = file_idx[sort_order]
+        gxs = gxs[sort_order]
+        gys = gys[sort_order]
+
+        # detect contiguous runs
+        breaks = np.where(np.diff(file_idx) != 1)[0] + 1
+        run_starts = np.concatenate(([0], breaks))
+        run_ends = np.concatenate((breaks, [len(file_idx)]))
+
+        # read each contiguous run
+        for rs, re in zip(run_starts, run_ends):
+            fi_start = int(file_idx[rs])
+            fi_end = int(file_idx[re - 1]) + 1
+            chunk = np.array(data[fi_start:fi_end])  # single contiguous read
+            # orientation fix: (N, C, H, W) → (N, H, W, C), rot90 CW, BGR→RGB
+            chunk = chunk.transpose(0, 2, 3, 1)
+            chunk = np.rot90(chunk, k=-1, axes=(1, 2))
+            chunk = chunk[:, :, ::-1]
+            # scatter into output buffer
+            lx = gxs[rs:re] - gx0
+            ly = gys[rs:re] - gy0
+            for k in range(re - rs):
+                buf[int(ly[k]) * IMG:(int(ly[k]) + 1) * IMG,
+                    int(lx[k]) * IMG:(int(lx[k]) + 1) * IMG] = chunk[k]
+
         return buf, vw, vh
 
     def _start_detail_build(self):
@@ -499,7 +584,7 @@ class Viewer:
         def clamp_region(gx0, gy0, gx1, gy1):
             max_imgs = MAX_TEX // IMG
             gx0 = max(0, gx0); gy0 = max(0, gy0)
-            gx1 = min(COLS, gx1); gy1 = min(ROWS, gy1)
+            gx1 = min(SIDE, gx1); gy1 = min(SIDE, gy1)
             vw, vh = gx1 - gx0, gy1 - gy0
             if vw > max_imgs:
                 ex = vw - max_imgs
@@ -585,8 +670,7 @@ class Viewer:
         self.prog['u_center'].value = (self.cx, self.cy)
         self.prog['u_ppi'].value    = self.ppi
         self.prog['u_screen'].value = (float(self.w), float(self.h))
-        self.prog['u_grid'].value   = (float(COLS), float(ROWS))
-        self.prog['u_num'].value    = NUM_IMAGES
+        self.prog['u_grid'].value   = (float(SIDE), float(SIDE))
 
         self.vao.render(moderngl.TRIANGLE_STRIP)
 
