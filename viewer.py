@@ -557,6 +557,10 @@ class Viewer:
         self._dot_needs_rebuild = False
         self._dot_journal = set()       # indices changed since last rebuild
         self._dot_journal_lock = threading.Lock()
+        self._ok_cells_buf = None       # cached GPU buffer for dim-mode ok dots
+        self._ok_cells_vao = None
+        self._ok_cells_n = 0
+        self._ok_cells_dirty = True     # rebuild when ok set changes
         self._rebuild_dots()
 
         print(f"Hilbert grid {SIDE}×{SIDE} (order {ORDER}) = {NUM_IMAGES:,} images", flush=True)
@@ -1396,6 +1400,7 @@ class Viewer:
         if not journal:
             return
 
+        self._ok_cells_dirty = True
         # Separate new dots from color updates
         new_dots = []
         color_updates = []
@@ -1514,32 +1519,42 @@ class Viewer:
 
         # ── undimmed ok cells (when dimmed + zoomed out past hi-res) ──
         if self._dim_mode and self.ppi < FETCH_MIN_PPI and self._dot_n > 0:
-            ok_mask = self._link_status[self._dot_checked] == STATUS_CODES['ok']
-            ok_count = ok_mask.sum()
-            if ok_count > 0:
-                ok_gx = self._dot_gx[ok_mask]
-                ok_gy = self._dot_gy[ok_mask]
-                ok_arr = self._dot_checked[ok_mask]
-                raw_avg = self.data[ok_arr].reshape(ok_count, CH, -1).mean(axis=2)
-                vdata = np.empty((ok_count, 5), dtype='f4')
-                vdata[:, 0] = ok_gx
-                vdata[:, 1] = ok_gy
-                vdata[:, 2] = raw_avg[:, 2] / 255.0  # R (was B)
-                vdata[:, 3] = raw_avg[:, 1] / 255.0  # G
-                vdata[:, 4] = raw_avg[:, 0] / 255.0  # B (was R)
-                buf = self.ctx.buffer(vdata.tobytes())
-                vao = self.ctx.vertex_array(
-                    self._dot_prog, [(buf, '2f 3f', 'grid_pos', 'color')])
+            if self._ok_cells_dirty:
+                self._ok_cells_dirty = False
+                ok_mask = self._link_status[self._dot_checked] == STATUS_CODES['ok']
+                ok_count = ok_mask.sum()
+                if self._ok_cells_buf is not None:
+                    self._ok_cells_vao.release()
+                    self._ok_cells_buf.release()
+                    self._ok_cells_buf = None
+                    self._ok_cells_vao = None
+                    self._ok_cells_n = 0
+                if ok_count > 0:
+                    ok_gx = self._dot_gx[ok_mask]
+                    ok_gy = self._dot_gy[ok_mask]
+                    ok_arr = self._dot_checked[ok_mask]
+                    raw_avg = self.data[ok_arr].reshape(ok_count, CH, -1).mean(axis=2)
+                    vdata = np.empty((ok_count, 5), dtype='f4')
+                    vdata[:, 0] = ok_gx
+                    vdata[:, 1] = ok_gy
+                    vdata[:, 2] = raw_avg[:, 2] / 255.0  # R (was B)
+                    vdata[:, 3] = raw_avg[:, 1] / 255.0  # G
+                    vdata[:, 4] = raw_avg[:, 0] / 255.0  # B (was R)
+                    self._ok_cells_buf = self.ctx.buffer(vdata.tobytes())
+                    self._ok_cells_vao = self.ctx.vertex_array(
+                        self._dot_prog,
+                        [(self._ok_cells_buf, '2f 3f', 'grid_pos', 'color')])
+                    self._ok_cells_n = ok_count
+            if self._ok_cells_n > 0:
                 self.ctx.enable(moderngl.PROGRAM_POINT_SIZE)
                 self._dot_prog['u_center'].value = (self.cx, self.cy)
                 self._dot_prog['u_ppi'].value = self.ppi
                 self._dot_prog['u_screen'].value = (float(self.w), float(self.h))
                 self._dot_prog['u_square'].value = 1
-                vao.render(moderngl.POINTS)
+                self._ok_cells_vao.render(moderngl.POINTS,
+                                          vertices=self._ok_cells_n)
                 self.ctx.disable(moderngl.PROGRAM_POINT_SIZE)
                 self._dot_prog['u_square'].value = 0
-                vao.release()
-                buf.release()
 
         # ── fetched image overlays ──
         if self._fetched_textures and self.ppi >= FETCH_MIN_PPI:
