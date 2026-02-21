@@ -1213,7 +1213,8 @@ class Viewer:
         run_starts = np.concatenate(([0], breaks))
         run_ends = np.concatenate((breaks, [len(file_idx)]))
 
-        # read each contiguous run
+        # read each contiguous run and scatter into output buffer
+        ri = np.arange(IMG)
         for rs, re in zip(run_starts, run_ends):
             if cancel is not None and cancel.is_set():
                 return buf, vw, vh
@@ -1224,12 +1225,12 @@ class Viewer:
             chunk = chunk.transpose(0, 2, 3, 1)
             chunk = np.rot90(chunk, k=-1, axes=(1, 2))
             chunk = chunk[:, :, ::-1]
-            # scatter into output buffer
+            # vectorized scatter via advanced indexing
             lx = gxs[rs:re] - gx0
             ly = gys[rs:re] - gy0
-            for k in range(re - rs):
-                buf[int(ly[k]) * IMG:(int(ly[k]) + 1) * IMG,
-                    int(lx[k]) * IMG:(int(lx[k]) + 1) * IMG] = chunk[k]
+            row_idx = ly[:, None, None] * IMG + ri[None, :, None]
+            col_idx = lx[:, None, None] * IMG + ri[None, None, :]
+            buf[row_idx, col_idx] = chunk
 
         return buf, vw, vh
 
