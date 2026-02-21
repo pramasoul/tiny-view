@@ -1436,7 +1436,19 @@ class Viewer:
                 self._overlay_prog['u_rect'].value = (x0, y0, x1, y1)
                 self._overlay_vao.render(moderngl.TRIANGLE_STRIP)
 
-        # ── metadata overlay ──
+        # ── link-check dots (cached buffer) ──
+        if self._show_dots and self._dot_n > 0 and self._dot_vao is not None:
+            self.ctx.enable(moderngl.BLEND | moderngl.PROGRAM_POINT_SIZE)
+            self.ctx.blend_func = (
+                moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
+            self._dot_prog['u_center'].value = (self.cx, self.cy)
+            self._dot_prog['u_ppi'].value = self.ppi
+            self._dot_prog['u_screen'].value = (float(self.w), float(self.h))
+            self._dot_prog['u_square'].value = 0
+            self._dot_vao.render(moderngl.POINTS)
+            self.ctx.disable(moderngl.BLEND | moderngl.PROGRAM_POINT_SIZE)
+
+        # ── metadata overlay (on top of dots) ──
         if self._show_meta and self._hover_idx >= 0:
             self._render_meta_texture(self._hover_idx)
             if self._meta_tex is not None:
@@ -1462,18 +1474,6 @@ class Viewer:
                 self._overlay_prog['u_rect'].value = (x0, y0, x1, y1)
                 self._overlay_vao.render(moderngl.TRIANGLE_STRIP)
                 self.ctx.disable(moderngl.BLEND)
-
-        # ── link-check dots (cached buffer) ──
-        if self._show_dots and self._dot_n > 0 and self._dot_vao is not None:
-            self.ctx.enable(moderngl.BLEND | moderngl.PROGRAM_POINT_SIZE)
-            self.ctx.blend_func = (
-                moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
-            self._dot_prog['u_center'].value = (self.cx, self.cy)
-            self._dot_prog['u_ppi'].value = self.ppi
-            self._dot_prog['u_screen'].value = (float(self.w), float(self.h))
-            self._dot_prog['u_square'].value = 0
-            self._dot_vao.render(moderngl.POINTS)
-            self.ctx.disable(moderngl.BLEND | moderngl.PROGRAM_POINT_SIZE)
 
     # ── main loop ─────────────────────────────────────────────────────
     def run(self):
