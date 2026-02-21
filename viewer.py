@@ -834,7 +834,7 @@ class Viewer:
 
     # ── link checking ────────────────────────────────────────────────
     def _enqueue_link_check(self, idx):
-        """Queue a HEAD request for the source URL of image *idx*."""
+        """Queue a GET check+fetch for the source URL of image *idx*."""
         with self._link_lock:
             if idx in self._link_checks:
                 return
@@ -842,61 +842,41 @@ class Viewer:
         self._dirty = True
         self._link_pool.submit(self._check_link, idx)
 
-    def _check_link(self, idx):
-        """HEAD-request the source URL and classify the result (runs in thread pool)."""
-        meta = self._read_meta(idx)
-        url = meta['source_url'].strip('\x00 ')
-        if not url:
-            status = 'no_url'
-        else:
-            if not url.startswith(('http://', 'https://')):
-                url = 'http://' + url
-            try:
-                req = urllib.request.Request(url, method='HEAD')
-                opener = urllib.request.build_opener(_NoRedirectHandler)
-                resp = opener.open(req, timeout=LINK_TIMEOUT)
-                code = resp.getcode()
-                status = 'ok' if 200 <= code < 300 else 'error'
-            except urllib.error.HTTPError as e:
-                if e.code in (301, 302, 307, 308):
-                    status = 'moved'
-                elif e.code == 404:
-                    status = 'not_found'
-                else:
-                    status = 'error'
-            except socket.gaierror:
-                status = 'dns'
-            except Exception:
-                status = 'error'
+    def _set_link_status(self, idx, status):
+        """Update link status in memory, mmap, and dot journal."""
         with self._link_lock:
             self._link_checks[idx] = status
             self._link_status[idx] = STATUS_CODES.get(status, 5)
         with self._dot_journal_lock:
             self._dot_journal.add(idx)
         self._link_dirty = True
-        if status == 'ok':
-            self._fetch_image(idx, url)
 
-    def _fetch_image(self, idx, url):
-        """GET the image at *url*, center-crop square, and queue for GPU upload."""
+    def _check_link(self, idx):
+        """GET the source URL, classify it, and fetch the image (runs in thread pool)."""
+        meta = self._read_meta(idx)
+        url = meta['source_url'].strip('\x00 ')
+        if not url:
+            self._set_link_status(idx, 'no_url')
+            return
+        if not url.startswith(('http://', 'https://')):
+            url = 'http://' + url
         try:
-            print(f"  fetch #{idx} GET {url[:80]}", flush=True)
+            print(f"  check #{idx} GET {url[:80]}", flush=True)
             req = urllib.request.Request(
                 url, headers={'User-Agent': 'TinyImagesViewer/1.0'})
-            resp = urllib.request.urlopen(req, timeout=LINK_TIMEOUT)
+            opener = urllib.request.build_opener(_NoRedirectHandler)
+            resp = opener.open(req, timeout=LINK_TIMEOUT)
+            code = resp.getcode()
+            if not (200 <= code < 300):
+                self._set_link_status(idx, 'error')
+                return
             ctype = resp.headers.get('Content-Type', '')
             if not ctype.startswith('image/'):
-                print(f"  fetch #{idx} not image: {ctype}", flush=True)
-                with self._link_lock:
-                    self._link_checks[idx] = 'not_image'
-                    self._link_status[idx] = STATUS_CODES['not_image']
-                with self._dot_journal_lock:
-                    self._dot_journal.add(idx)
-                self._link_dirty = True
-                self._fetched_loading.discard(idx)
+                print(f"  check #{idx} not image: {ctype}", flush=True)
+                self._set_link_status(idx, 'not_image')
                 return
             raw = resp.read(16 * 1024 * 1024)  # 16 MB cap
-            print(f"  fetch #{idx} got {len(raw)} bytes", flush=True)
+            print(f"  check #{idx} ok {len(raw)} bytes", flush=True)
             img = Image.open(io.BytesIO(raw)).convert('RGB')
             w, h = img.size
             s = min(w, h)
@@ -906,20 +886,23 @@ class Viewer:
                 img = img.resize((FETCH_MAX_SIZE, FETCH_MAX_SIZE), Image.LANCZOS)
             self._save_fetched(idx, img)
             pixels = np.asarray(img, dtype='uint8').copy()
-            print(f"  fetch #{idx} image {w}x{h} → {pixels.shape}", flush=True)
+            print(f"  check #{idx} image {w}x{h} → {pixels.shape}", flush=True)
+            self._set_link_status(idx, 'ok')
             gx, gy = hilbert_d2xy(ORDER, np.int64(idx))
             with self._fetched_lock:
                 self._fetched_queue.append((idx, int(gx), int(gy), pixels))
-            self._link_dirty = True
+        except urllib.error.HTTPError as e:
+            if e.code in (301, 302, 307, 308):
+                self._set_link_status(idx, 'moved')
+            elif e.code == 404:
+                self._set_link_status(idx, 'not_found')
+            else:
+                self._set_link_status(idx, 'error')
+        except socket.gaierror:
+            self._set_link_status(idx, 'dns')
         except Exception as e:
-            print(f"  fetch #{idx} FAILED: {e}", flush=True)
-            with self._link_lock:
-                self._link_checks[idx] = 'error'
-                self._link_status[idx] = STATUS_CODES['error']
-            with self._dot_journal_lock:
-                self._dot_journal.add(idx)
-            self._link_dirty = True
-            self._fetched_loading.discard(idx)
+            print(f"  check #{idx} FAILED: {e}", flush=True)
+            self._set_link_status(idx, 'error')
 
     def _migrate_offsets(self):
         """One-time migration: scan tar shards to populate offset/size."""
@@ -1012,16 +995,9 @@ class Viewer:
         """Load one image from cache or network, queue for GPU upload."""
         pixels = self._load_fetched(idx)
         if pixels is None:
-            meta = self._read_meta(idx)
-            url = meta['source_url'].strip('\x00 ')
-            if not url:
-                self._fetched_loading.discard(idx)
-                return
-            if not url.startswith(('http://', 'https://')):
-                url = 'http://' + url
-            self._fetch_image(idx, url)
-            if idx not in self._fi_set:
-                self._fetched_loading.discard(idx)
+            # not in cache — do a full check+fetch
+            self._check_link(idx)
+            self._fetched_loading.discard(idx)
             return
         gx, gy = hilbert_d2xy(ORDER, np.int64(idx))
         with self._fetched_lock:
