@@ -531,6 +531,7 @@ class Viewer:
         self._dot_vao = None
         self._dot_n = 0
         self._dot_last_rebuild = 0.0
+        self._dot_needs_rebuild = False
         self._rebuild_dots()
 
         print(f"Hilbert grid {SIDE}×{SIDE} (order {ORDER}) = {NUM_IMAGES:,} images", flush=True)
@@ -1429,21 +1430,24 @@ class Viewer:
 
                 if self._link_dirty:
                     self._link_dirty = False
+                    self._dot_needs_rebuild = True
                     self._dirty = True
 
-                # Rebuild dot buffer (throttled — heavy with 1M+ dots)
-                now = time.time()
-                if now - self._dot_last_rebuild > 0.5:
-                    old_n = self._dot_n
-                    self._rebuild_dots()
-                    self._dot_last_rebuild = now
-                    if self._dot_n != old_n:
+                # Rebuild dot buffer only when needed (throttled)
+                if self._dot_needs_rebuild:
+                    now = time.time()
+                    if now - self._dot_last_rebuild > 0.5:
+                        self._rebuild_dots()
+                        self._dot_last_rebuild = now
+                        self._dot_needs_rebuild = False
                         self._dirty = True
 
                 if self._upload_pending_fetches():
                     self._dirty = True
 
-                self._manage_fetched_textures()
+                # Only check fetched textures when viewport or data changed
+                if self._dirty:
+                    self._manage_fetched_textures()
 
                 # Kick off background build if needed
                 feasible = self._detail_feasible()
