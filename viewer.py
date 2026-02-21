@@ -892,7 +892,9 @@ class Viewer:
             img = img.crop((left, top, left + s, top + s))
             if s > FETCH_MAX_SIZE:
                 img = img.resize((FETCH_MAX_SIZE, FETCH_MAX_SIZE), Image.LANCZOS)
-            self._save_fetched(idx, img)
+            if not self._save_fetched(idx, img):
+                self._set_link_status(idx, 'error')
+                return
             pixels = np.asarray(img, dtype='uint8').copy()
             print(f"  check #{idx} image {w}x{h} → {pixels.shape}", flush=True)
             self._set_link_status(idx, 'ok')
@@ -937,21 +939,48 @@ class Viewer:
             print(f"Migrated {total} cache entries with byte offsets", flush=True)
 
     def _open_shard(self):
-        """Open (or reopen) the current shard tar for appending."""
+        """Open (or reopen) the current shard tar for appending.
+
+        If the tar is corrupt (e.g. from a crash mid-write), truncate
+        back to the last complete entry and retry.
+        """
         if self._shard_tf is not None:
             self._shard_tf.close()
         shard = f"shard_{self._shard_num:06d}.tar"
         path = os.path.join(self._fetch_dir, shard)
-        self._shard_tf = tarfile.open(path, 'a')
+        try:
+            self._shard_tf = tarfile.open(path, 'a')
+        except tarfile.ReadError:
+            self._repair_shard(path)
+            self._shard_tf = tarfile.open(path, 'a')
         return shard
 
+    def _repair_shard(self, path):
+        """Truncate a corrupt tar back to the last complete entry."""
+        size = os.path.getsize(path)
+        safe = 0
+        try:
+            with tarfile.open(path, 'r') as tf:
+                for member in tf:
+                    end = member.offset + 512 + ((member.size + 511) // 512) * 512
+                    if end > size:
+                        break
+                    safe = end
+        except tarfile.ReadError:
+            pass
+        if safe < size:
+            print(f"Repairing {path}: truncating from {size} to {safe} "
+                  f"({(size - safe)} bytes removed)", flush=True)
+            with open(path, 'r+b') as f:
+                f.truncate(safe)
+
     def _save_fetched(self, idx, img):
-        """Save a fetched PIL image to the current tar shard."""
+        """Save a fetched PIL image to the current tar shard. Returns True on success."""
         try:
             with self._shard_lock:
                 if self._fetch_db.execute(
                         'SELECT 1 FROM images WHERE idx=?', (idx,)).fetchone():
-                    return
+                    return True
                 jpeg_buf = io.BytesIO()
                 img.save(jpeg_buf, format='JPEG', quality=90)
                 jpeg_data = jpeg_buf.getvalue()
@@ -976,8 +1005,10 @@ class Viewer:
                 if self._shard_dirty >= 50:
                     self._fetch_db.commit()
                     self._shard_dirty = 0
+                return True
         except Exception as e:
             print(f"  cache save #{idx} FAILED: {e}", flush=True)
+            return False
 
     def _load_fetched(self, idx):
         """Load a fetched image from the tar cache. Returns pixels array or None."""
@@ -1047,6 +1078,7 @@ class Viewer:
 
     def _start_crawl(self, idx):
         self._stop_crawl()
+        self._enqueue_link_check(idx)
         self._crawl_cancel = threading.Event()
         self._crawl_origin = idx
         self._crawl_count = [0, 0]
