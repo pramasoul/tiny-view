@@ -853,6 +853,14 @@ class Viewer:
 
     def _check_link(self, idx):
         """GET the source URL, classify it, and fetch the image (runs in thread pool)."""
+        # already fetched — just mark ok and queue for display
+        cached = self._load_fetched(idx)
+        if cached is not None:
+            self._set_link_status(idx, 'ok')
+            gx, gy = hilbert_d2xy(ORDER, np.int64(idx))
+            with self._fetched_lock:
+                self._fetched_queue.append((idx, int(gx), int(gy), cached))
+            return
         meta = self._read_meta(idx)
         url = meta['source_url'].strip('\x00 ')
         if not url:
