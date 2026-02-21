@@ -371,6 +371,7 @@ class Viewer:
         self._bg_cancel = threading.Event()
         self._bg_lock = threading.Lock()
         self._bg_results = []    # [(key, buf, vw, vh), ...] from bg thread
+        self._det_build_vp = None  # viewport state last build was started for
 
         # keyword search (None = inactive, str = active query)
         self._search = None
@@ -542,14 +543,20 @@ class Viewer:
         # dot shader + cached dot buffer
         self._dot_prog = self.ctx.program(
             vertex_shader=DOT_VERT, fragment_shader=DOT_FRAG)
-        self._dot_checked = np.empty(0, dtype=np.int64)
+        self._dot_pos = {}              # idx → slot in GPU buffer
+        self._dot_checked = np.empty(0, dtype=np.int64)  # for ok-cells
         self._dot_gx = np.empty(0, dtype='f4')
         self._dot_gy = np.empty(0, dtype='f4')
         self._dot_buf = None
         self._dot_vao = None
         self._dot_n = 0
+        self._dot_cap = 0
         self._dot_last_rebuild = 0.0
+        self._tex_mgr_last = 0.0
+        self._viewport_changed = True
         self._dot_needs_rebuild = False
+        self._dot_journal = set()       # indices changed since last rebuild
+        self._dot_journal_lock = threading.Lock()
         self._rebuild_dots()
 
         print(f"Hilbert grid {SIDE}×{SIDE} (order {ORDER}) = {NUM_IMAGES:,} images", flush=True)
@@ -790,6 +797,8 @@ class Viewer:
         with self._link_lock:
             self._link_checks[idx] = status
             self._link_status[idx] = STATUS_CODES.get(status, 5)
+        with self._dot_journal_lock:
+            self._dot_journal.add(idx)
         self._link_dirty = True
         if status == 'ok':
             self._fetch_image(idx, url)
@@ -807,6 +816,8 @@ class Viewer:
                 with self._link_lock:
                     self._link_checks[idx] = 'not_image'
                     self._link_status[idx] = STATUS_CODES['not_image']
+                with self._dot_journal_lock:
+                    self._dot_journal.add(idx)
                 self._link_dirty = True
                 self._fetched_loading.discard(idx)
                 return
@@ -935,7 +946,6 @@ class Viewer:
         gx, gy = hilbert_d2xy(ORDER, np.int64(idx))
         with self._fetched_lock:
             self._fetched_queue.append((idx, int(gx), int(gy), pixels))
-        self._link_dirty = True
 
     def _reload_ok_images(self):
         """Reload all 'ok' images from cache (or network fallback)."""
@@ -1010,6 +1020,7 @@ class Viewer:
         self._hover_idx = -1
         self._update_title(mx, my)
         self._dirty = True
+        self._viewport_changed = True
 
     def _on_button(self, win, btn, action, _mods):
         if btn == glfw.MOUSE_BUTTON_LEFT:
@@ -1033,6 +1044,7 @@ class Viewer:
             self.cy -= (y - self.my) / ppi
             self.mx, self.my = x, y
             self._dirty = True
+            self._viewport_changed = True
         self._update_title(x, y)
         if self._show_meta or self._show_help:
             self._dirty = True
@@ -1053,6 +1065,7 @@ class Viewer:
             self.w, self.h = w, h
             self.ctx.viewport = (0, 0, w, h)
             self._dirty = True
+            self._viewport_changed = True
 
     def _on_key(self, win, key, _sc, action, _mods):
         if action not in (glfw.PRESS, glfw.REPEAT):
@@ -1148,7 +1161,13 @@ class Viewer:
 
     def _detail_feasible(self):
         """Can we have a detail texture at the current zoom?"""
-        return self.ppi >= DETAIL_MIN_PPI
+        if self.ppi < DETAIL_MIN_PPI:
+            return False
+        # Don't build if viewport exceeds max texture size (would just clamp)
+        max_imgs = MAX_TEX // IMG
+        hw = self.w / (2 * self.ppi)
+        hh = self.h / (2 * self.ppi)
+        return (2 * hw + 3) <= max_imgs and (2 * hh + 3) <= max_imgs
 
     def _detail_covers_viewport(self):
         """Does the cached detail texture fully cover the current viewport?"""
@@ -1226,6 +1245,7 @@ class Viewer:
         cx, cy = self.cx, self.cy
         w, h = self.w, self.h
         data = self.data
+        self._det_build_vp = (cx, cy, ppi, w, h)
 
         def clamp_region(gx0, gy0, gx1, gy1):
             max_imgs = MAX_TEX // IMG
@@ -1323,51 +1343,96 @@ class Viewer:
             self._fetched_textures[idx] = (tex, gx, gy)
         return True
 
-    def _rebuild_dots(self):
-        """Rebuild dot buffer. Caches grid positions, vectorizes colors."""
-        snapshot = np.array(self._link_status)
-        checked = np.nonzero(snapshot)[0].astype(np.int64)
-        n = len(checked)
-        if n == 0:
-            self._dot_n = 0
+    _DOT_STRIDE = 20  # 5 floats × 4 bytes: gx, gy, r, g, b
+
+    def _dot_ensure_capacity(self, needed):
+        """Grow the GPU buffer if needed, preserving existing data."""
+        if needed <= self._dot_cap:
             return
-        old_n = len(self._dot_checked)
-        if n != old_n:
-            if old_n == 0:
-                gx, gy = hilbert_d2xy(ORDER, checked)
-                self._dot_gx = gx.astype('f4')
-                self._dot_gy = gy.astype('f4')
-            else:
-                # Incremental: keep old positions, compute only new
-                old_in_new = np.searchsorted(checked, self._dot_checked)
-                full_gx = np.empty(n, dtype='f4')
-                full_gy = np.empty(n, dtype='f4')
-                full_gx[old_in_new] = self._dot_gx
-                full_gy[old_in_new] = self._dot_gy
-                is_new = np.ones(n, dtype=bool)
-                is_new[old_in_new] = False
-                new_idx = checked[is_new]
-                if len(new_idx) > 0:
-                    ngx, ngy = hilbert_d2xy(ORDER, new_idx)
-                    full_gx[is_new] = ngx.astype('f4')
-                    full_gy[is_new] = ngy.astype('f4')
-                self._dot_gx = full_gx
-                self._dot_gy = full_gy
-            self._dot_checked = checked.copy()
-        # Colors from mmap status codes (fully vectorized)
-        codes = snapshot[self._dot_checked]
-        vdata = np.empty((n, 5), dtype='f4')
-        vdata[:, 0] = self._dot_gx
-        vdata[:, 1] = self._dot_gy
-        vdata[:, 2:5] = STATUS_COLORS_LUT[codes]
-        if self._dot_buf is not None:
+        new_cap = max(needed, self._dot_cap * 2, 4096)
+        new_buf = self.ctx.buffer(reserve=new_cap * self._DOT_STRIDE)
+        if self._dot_buf is not None and self._dot_n > 0:
+            old_data = self._dot_buf.read(self._dot_n * self._DOT_STRIDE)
+            new_buf.write(old_data)
             self._dot_buf.release()
         if self._dot_vao is not None:
             self._dot_vao.release()
-        self._dot_buf = self.ctx.buffer(vdata.tobytes())
+        self._dot_buf = new_buf
         self._dot_vao = self.ctx.vertex_array(
             self._dot_prog, [(self._dot_buf, '2f 3f', 'grid_pos', 'color')])
-        self._dot_n = n
+        self._dot_cap = new_cap
+
+    def _rebuild_dots(self):
+        """Rebuild dot buffer incrementally using the change journal."""
+        with self._dot_journal_lock:
+            journal = self._dot_journal
+            self._dot_journal = set()
+        self._dot_journal_had_updates = bool(journal)
+
+        if self._dot_n == 0 and not self._dot_pos:
+            # Cold start: full scan of mmap to find all checked indices
+            snapshot = np.array(self._link_status)
+            checked = np.nonzero(snapshot)[0].astype(np.int64)
+            n = len(checked)
+            if n == 0:
+                return
+            gx, gy = hilbert_d2xy(ORDER, checked)
+            codes = snapshot[checked]
+            colors = STATUS_COLORS_LUT[codes]
+            vdata = np.empty((n, 5), dtype='f4')
+            vdata[:, 0] = gx.astype('f4')
+            vdata[:, 1] = gy.astype('f4')
+            vdata[:, 2:5] = colors
+            self._dot_ensure_capacity(n)
+            self._dot_buf.write(vdata.tobytes())
+            self._dot_pos = {int(idx): i for i, idx in enumerate(checked)}
+            self._dot_checked = checked
+            self._dot_gx = gx.astype('f4')
+            self._dot_gy = gy.astype('f4')
+            self._dot_n = n
+            return
+
+        if not journal:
+            return
+
+        # Separate new dots from color updates
+        new_dots = []
+        color_updates = []
+        for idx in journal:
+            if idx in self._dot_pos:
+                color_updates.append(idx)
+            else:
+                new_dots.append(idx)
+
+        # Color updates: write 12 bytes (r,g,b) at each dot's slot
+        if color_updates:
+            for idx in color_updates:
+                slot = self._dot_pos[idx]
+                code = self._link_status[idx]
+                rgb = np.array(STATUS_COLORS_LUT[code], dtype='f4')
+                self._dot_buf.write(rgb.tobytes(), offset=slot * self._DOT_STRIDE + 8)
+
+        # New dots: compute positions, append to buffer
+        if new_dots:
+            new_arr = np.array(new_dots, dtype=np.int64)
+            ngx, ngy = hilbert_d2xy(ORDER, new_arr)
+            codes = self._link_status[new_arr]
+            colors = STATUS_COLORS_LUT[codes]
+            n_new = len(new_dots)
+            self._dot_ensure_capacity(self._dot_n + n_new)
+            vdata = np.empty((n_new, 5), dtype='f4')
+            vdata[:, 0] = ngx.astype('f4')
+            vdata[:, 1] = ngy.astype('f4')
+            vdata[:, 2:5] = colors
+            self._dot_buf.write(vdata.tobytes(),
+                                offset=self._dot_n * self._DOT_STRIDE)
+            for i, idx in enumerate(new_dots):
+                self._dot_pos[idx] = self._dot_n + i
+            # Extend cached arrays for ok-cells feature
+            self._dot_checked = np.concatenate([self._dot_checked, new_arr])
+            self._dot_gx = np.concatenate([self._dot_gx, ngx.astype('f4')])
+            self._dot_gy = np.concatenate([self._dot_gy, ngy.astype('f4')])
+            self._dot_n += n_new
 
     def _manage_fetched_textures(self):
         """Evict off-screen textures, load visible cached images."""
@@ -1503,7 +1568,7 @@ class Viewer:
             self._dot_prog['u_ppi'].value = self.ppi
             self._dot_prog['u_screen'].value = (float(self.w), float(self.h))
             self._dot_prog['u_square'].value = 0
-            self._dot_vao.render(moderngl.POINTS)
+            self._dot_vao.render(moderngl.POINTS, vertices=self._dot_n)
             self.ctx.disable(moderngl.BLEND | moderngl.PROGRAM_POINT_SIZE)
 
         # ── info overlay (on top of dots): metadata or help ──
@@ -1551,12 +1616,12 @@ class Viewer:
             while not glfw.window_should_close(self.win):
                 if self._dirty:
                     self._dirty = False
-                    self._render()              # instant — uses stale cache
+                    self._render()
                     glfw.swap_buffers(self.win)
 
                 # Pick up completed background build
                 if self._upload_pending_detail():
-                    self._dirty = True          # re-render with fresh detail
+                    self._dirty = True
 
                 if self._link_dirty:
                     self._link_dirty = False
@@ -1567,22 +1632,29 @@ class Viewer:
                 if self._dot_needs_rebuild:
                     now = time.time()
                     if now - self._dot_last_rebuild > 0.5:
+                        old_n = self._dot_n
                         self._rebuild_dots()
                         self._dot_last_rebuild = now
                         self._dot_needs_rebuild = False
-                        self._dirty = True
+                        if self._dot_n != old_n or self._dot_journal_had_updates:
+                            self._dirty = True
 
+                # Upload completed texture loads (triggers render but not tex manager)
                 if self._upload_pending_fetches():
                     self._dirty = True
 
-                # Only check fetched textures when viewport or data changed
-                if self._dirty:
+                # Only check fetched textures on viewport change (not on uploads)
+                if self._viewport_changed:
+                    self._viewport_changed = False
                     self._manage_fetched_textures()
 
-                # Kick off background build if needed
+                # Kick off background build if needed (but don't restart one in flight)
                 feasible = self._detail_feasible()
                 if feasible and not self._detail_covers_viewport():
-                    self._start_detail_build()
+                    cur_vp = (self.cx, self.cy, self.ppi, self.w, self.h)
+                    if (not (self._bg_thread and self._bg_thread.is_alive())
+                            and self._det_build_vp != cur_vp):
+                        self._start_detail_build()
                 elif not feasible and self._det_tex is not None:
                     self._det_tex.release()
                     self._det_tex = None
