@@ -375,7 +375,10 @@ class Viewer:
         except OSError:
             pass
 
-    def __init__(self, data_dir=None):
+    def __init__(self, data_dir=None, verbose=False, quiet=False):
+        self._verbose = verbose
+        self._quiet = quiet
+
         # resolve data paths
         dd = data_dir or DATA_DIR
         self._filename  = os.path.join(dd, 'tiny_images.bin')
@@ -445,7 +448,8 @@ class Viewer:
         )
 
         # ── data ──
-        print(f"Memory-mapping {self._filename} …")
+        if not self._quiet:
+            print(f"Memory-mapping {self._filename} …")
         self.data = np.memmap(self._filename, dtype='uint8', mode='r',
                               shape=(NUM_IMAGES, CH, IMG, IMG))
 
@@ -501,7 +505,7 @@ class Viewer:
         for i in checked:
             self._link_checks[int(i)] = STATUS_NAMES.get(
                 int(self._link_status[i]), 'error')
-        if checked.size:
+        if checked.size and not self._quiet:
             print(f"Restored {checked.size:,} link checks from cache",
                   flush=True)
 
@@ -558,7 +562,7 @@ class Viewer:
         else:
             self._shard_num = 0
         cached = self._fetch_db.execute('SELECT COUNT(*) FROM images').fetchone()[0]
-        if cached:
+        if cached and not self._quiet:
             print(f"Fetched image cache: {cached} images in {len(shard_files)} shard(s)",
                   flush=True)
 
@@ -605,8 +609,13 @@ class Viewer:
         self._ok_cells_dirty = True     # rebuild when ok set changes
         self._rebuild_dots()
 
-        print(f"Hilbert grid {SIDE}×{SIDE} (order {ORDER}) = {NUM_IMAGES:,} images", flush=True)
-        print("Scroll=zoom  Drag=pan  Click=check  C=crawl  D=dim  R=reload  F=full  M=meta  H=help  L=dots  /=search  Esc/Q=quit", flush=True)
+        # status line state
+        self._status_last = 0.0
+        self._status_shown = False
+
+        if not self._quiet:
+            print(f"Hilbert grid {SIDE}×{SIDE} (order {ORDER}) = {NUM_IMAGES:,} images", flush=True)
+            print("Scroll=zoom  Drag=pan  Click=check  C=crawl  D=dim  R=reload  F=full  M=meta  H=help  L=dots  /=search  Esc/Q=quit", flush=True)
 
     # ── properties ────────────────────────────────────────────────────
     @property
@@ -833,14 +842,14 @@ class Viewer:
         glfw.set_window_title(self.win, "  |  ".join(parts))
 
     # ── link checking ────────────────────────────────────────────────
-    def _enqueue_link_check(self, idx):
+    def _enqueue_link_check(self, idx, verbose=False):
         """Queue a GET check+fetch for the source URL of image *idx*."""
         with self._link_lock:
             if idx in self._link_checks:
                 return
             self._link_checks[idx] = 'pending'
         self._dirty = True
-        self._link_pool.submit(self._check_link, idx)
+        self._link_pool.submit(self._check_link, idx, verbose)
 
     def _set_link_status(self, idx, status):
         """Update link status in memory, mmap, and dot journal."""
@@ -851,8 +860,9 @@ class Viewer:
             self._dot_journal.add(idx)
         self._link_dirty = True
 
-    def _check_link(self, idx):
+    def _check_link(self, idx, verbose=False):
         """GET the source URL, classify it, and fetch the image (runs in thread pool)."""
+        loud = (self._verbose or verbose) and not self._quiet
         # already fetched — just mark ok and queue for display
         cached = self._load_fetched(idx)
         if cached is not None:
@@ -869,7 +879,8 @@ class Viewer:
         if not url.startswith(('http://', 'https://')):
             url = 'http://' + url
         try:
-            print(f"  check #{idx} GET {url[:80]}", flush=True)
+            if loud:
+                print(f"  check #{idx} GET {url[:80]}", flush=True)
             req = urllib.request.Request(
                 url, headers={'User-Agent': 'TinyImagesViewer/1.0'})
             opener = urllib.request.build_opener(_NoRedirectHandler)
@@ -880,11 +891,13 @@ class Viewer:
                 return
             ctype = resp.headers.get('Content-Type', '')
             if not ctype.startswith('image/'):
-                print(f"  check #{idx} not image: {ctype}", flush=True)
+                if loud:
+                    print(f"  check #{idx} not image: {ctype}", flush=True)
                 self._set_link_status(idx, 'not_image')
                 return
             raw = resp.read(16 * 1024 * 1024)  # 16 MB cap
-            print(f"  check #{idx} ok {len(raw)} bytes", flush=True)
+            if loud:
+                print(f"  check #{idx} ok {len(raw)} bytes", flush=True)
             img = Image.open(io.BytesIO(raw)).convert('RGB')
             w, h = img.size
             s = min(w, h)
@@ -896,7 +909,8 @@ class Viewer:
                 self._set_link_status(idx, 'error')
                 return
             pixels = np.asarray(img, dtype='uint8').copy()
-            print(f"  check #{idx} image {w}x{h} → {pixels.shape}", flush=True)
+            if loud:
+                print(f"  check #{idx} image {w}x{h} → {pixels.shape}", flush=True)
             self._set_link_status(idx, 'ok')
             gx, gy = hilbert_d2xy(ORDER, np.int64(idx))
             with self._fetched_lock:
@@ -911,7 +925,8 @@ class Viewer:
         except socket.gaierror:
             self._set_link_status(idx, 'dns')
         except Exception as e:
-            print(f"  check #{idx} FAILED: {e}", flush=True)
+            if loud:
+                print(f"  check #{idx} FAILED: {e}", flush=True)
             self._set_link_status(idx, 'error')
 
     def _migrate_offsets(self):
@@ -935,7 +950,7 @@ class Viewer:
                         (member.offset_data, member.size, idx))
                     total += 1
         self._fetch_db.commit()
-        if total:
+        if total and not self._quiet:
             print(f"Migrated {total} cache entries with byte offsets", flush=True)
 
     def _open_shard(self):
@@ -977,8 +992,9 @@ class Viewer:
                     break  # data truncated
                 f.seek(data_blocks * 512, 1)
                 safe = entry_end
-        print(f"Repairing {path}: truncating to {safe} and re-terminating "
-              f"({file_size - safe} bytes removed)", flush=True)
+        if not self._quiet:
+            print(f"Repairing {path}: truncating to {safe} and re-terminating "
+                  f"({file_size - safe} bytes removed)", flush=True)
         with open(path, 'r+b') as f:
             f.seek(safe)
             f.write(b'\x00' * 1024)  # two 512-byte end-of-archive blocks
@@ -1017,7 +1033,8 @@ class Viewer:
                     self._shard_dirty = 0
                 return True
         except Exception as e:
-            print(f"  cache save #{idx} FAILED: {e}", flush=True)
+            if self._verbose:
+                print(f"  cache save #{idx} FAILED: {e}", flush=True)
             return False
 
     def _load_fetched(self, idx):
@@ -1037,7 +1054,8 @@ class Viewer:
             img = Image.open(io.BytesIO(data)).convert('RGB')
             return np.asarray(img, dtype='uint8').copy()
         except Exception as e:
-            print(f"  cache load #{idx} FAILED: {e}", flush=True)
+            if self._verbose:
+                print(f"  cache load #{idx} FAILED: {e}", flush=True)
             return None
 
     def _reload_one(self, idx):
@@ -1058,9 +1076,11 @@ class Viewer:
             ok_indices = [i for i, s in self._link_checks.items()
                           if s == 'ok' and i not in self._fetched_textures]
         if not ok_indices:
-            print("No ok images to reload", flush=True)
+            if self._verbose:
+                print("No ok images to reload", flush=True)
             return
-        print(f"Reloading {len(ok_indices)} ok images …", flush=True)
+        if self._verbose:
+            print(f"Reloading {len(ok_indices)} ok images …", flush=True)
         for idx in ok_indices:
             self._link_pool.submit(self._reload_one, idx)
 
@@ -1078,7 +1098,8 @@ class Viewer:
             if self._link_status[idx]:
                 consec += 1
                 if consec >= CRAWL_STOP_RUN:
-                    print(f"  crawl {label} stopped: {CRAWL_STOP_RUN} consecutive already-checked at #{idx:,}", flush=True)
+                    if self._verbose:
+                        print(f"  crawl {label} stopped: {CRAWL_STOP_RUN} consecutive already-checked at #{idx:,}", flush=True)
                     break
                 continue   # skip already-checked instantly
             consec = 0
@@ -1097,7 +1118,8 @@ class Viewer:
         self._crawl_threads = [fwd, bwd]
         fwd.start()
         bwd.start()
-        print(f"Crawl started from #{idx:,}", flush=True)
+        if self._verbose:
+            print(f"Crawl started from #{idx:,}", flush=True)
 
     def _stop_crawl(self):
         if self._crawl_threads:
@@ -1105,9 +1127,36 @@ class Viewer:
             for t in self._crawl_threads:
                 t.join(timeout=1.0)
             total = sum(self._crawl_count)
-            if total:
+            self._print_status()
+            if self._status_shown:
+                print(flush=True)  # newline after final status
+                self._status_shown = False
+            if total and self._verbose:
                 print(f"Crawl stopped ({total:,} checked)", flush=True)
             self._crawl_threads = []
+
+    def _print_status(self):
+        """Overwrite the current terminal line with aggregate crawl stats."""
+        if self._quiet:
+            return
+        snap = np.array(self._link_status)
+        counts = np.bincount(snap, minlength=9)
+        # counts[0] = unchecked, 1=pending, 2=ok, 3=moved, 4=not_found,
+        #             5=error, 6=dns, 7=no_url, 8=not_image
+        total = int(counts[1:].sum())
+        pending = int(counts[1])
+        parts = []
+        if counts[2]: parts.append(f"ok:{counts[2]}")
+        if counts[3]: parts.append(f"moved:{counts[3]}")
+        if counts[4]: parts.append(f"404:{counts[4]}")
+        if counts[5]: parts.append(f"err:{counts[5]}")
+        if counts[6]: parts.append(f"dns:{counts[6]}")
+        if counts[7]: parts.append(f"no_url:{counts[7]}")
+        if counts[8]: parts.append(f"!img:{counts[8]}")
+        line = ' '.join(parts)
+        line += f" | cached:{len(self._fi_set)} pend:{pending} total:{total}"
+        print(f"\r{line}\033[K", end='', flush=True)
+        self._status_shown = True
 
     # ── input callbacks ───────────────────────────────────────────────
     def _on_scroll(self, win, _dx, dy):
@@ -1141,7 +1190,7 @@ class Viewer:
                 if dx * dx + dy * dy < 9:
                     idx = self._screen_to_image_idx(rx, ry)
                     if idx >= 0:
-                        self._enqueue_link_check(idx)
+                        self._enqueue_link_check(idx, verbose=True)
 
     def _on_cursor(self, win, x, y):
         if self.dragging:
@@ -1801,6 +1850,13 @@ class Viewer:
                     self._stop_crawl()
                     self._dirty = True
 
+                # Periodic status line during crawl
+                if self._crawl_threads or self._status_shown:
+                    now_s = time.monotonic()
+                    if now_s - self._status_last >= 1.0:
+                        self._status_last = now_s
+                        self._print_status()
+
                 # Poll faster while a build is in flight or crawl is active
                 busy = ((self._bg_thread and self._bg_thread.is_alive())
                         or self._crawl_threads)
@@ -1822,5 +1878,10 @@ if __name__ == '__main__':
         description='Interactive viewer for the 80 Million Tiny Images dataset')
     parser.add_argument('--data-dir', default=None,
                         help=f'Path to data directory (default: {DATA_DIR})')
+    parser.add_argument('-v', '--verbose', action='store_true',
+                        help='Show per-image crawl/fetch output')
+    parser.add_argument('-q', '--quiet', action='store_true',
+                        help='Suppress all output except fatal errors')
     args = parser.parse_args()
-    Viewer(data_dir=args.data_dir).run()
+    Viewer(data_dir=args.data_dir, verbose=args.verbose,
+           quiet=args.quiet).run()
