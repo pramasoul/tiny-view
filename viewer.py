@@ -732,13 +732,28 @@ class Viewer:
             "Esc        windowed (if fullscreen) / quit",
             "Q          quit",
         ]
+        # dot color legend: (label, R, G, B)
+        dot_legend = [
+            ("ok",        0, 230, 0),
+            ("moved",     255, 255, 0),
+            ("pending",   255, 153, 0),
+            ("not_found", 255, 0, 0),
+            ("error",     179, 0, 0),
+            ("dns",       204, 0, 204),
+            ("no_url",    128, 128, 128),
+            ("not_image", 102, 102, 179),
+        ]
         font = ImageFont.load_default(size=16)
         pad = 12
         line_h = font.getbbox("Ag")[3] + 4
-        # measure width from longest line
-        max_w = max(font.getbbox(ln)[2] for ln in lines)
+        # measure width from longest line (including legend section)
+        legend_label_w = max(font.getbbox(lbl)[2] for lbl, *_ in dot_legend)
+        dot_r = line_h // 2 - 1
+        legend_line_w = dot_r * 2 + 6 + legend_label_w
+        max_w = max(max(font.getbbox(ln)[2] for ln in lines), legend_line_w)
         tw = max_w + pad * 2
-        th = line_h * len(lines) + pad * 2
+        # extra space: blank line + header + legend entries
+        th = line_h * (len(lines) + 2 + len(dot_legend)) + pad * 2
 
         img = Image.new('RGBA', (tw, th), (0, 0, 0, 200))
         draw = ImageDraw.Draw(img)
@@ -752,6 +767,19 @@ class Viewer:
                 draw.text((pad + kw, y), parts[1], fill=(255, 255, 255, 255), font=font)
             else:
                 draw.text((pad, y), ln, fill=(255, 255, 255, 255), font=font)
+            y += line_h
+
+        # dot color legend
+        y += line_h  # blank line
+        draw.text((pad, y), "Dot colors:", fill=(120, 220, 255, 255), font=font)
+        y += line_h
+        for label, r, g, b in dot_legend:
+            cx = pad + dot_r
+            cy = y + line_h // 2
+            draw.ellipse((cx - dot_r, cy - dot_r, cx + dot_r, cy + dot_r),
+                         fill=(r, g, b, 255))
+            draw.text((pad + dot_r * 2 + 6, y), label,
+                      fill=(255, 255, 255, 255), font=font)
             y += line_h
 
         buf = img.tobytes()
@@ -885,6 +913,12 @@ class Viewer:
             self._link_dirty = True
         except Exception as e:
             print(f"  fetch #{idx} FAILED: {e}", flush=True)
+            with self._link_lock:
+                self._link_checks[idx] = 'error'
+                self._link_status[idx] = STATUS_CODES['error']
+            with self._dot_journal_lock:
+                self._dot_journal.add(idx)
+            self._link_dirty = True
             self._fetched_loading.discard(idx)
 
     def _migrate_offsets(self):
