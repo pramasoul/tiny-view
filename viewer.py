@@ -18,6 +18,7 @@ Controls:
   R          reload ok images from cache (or network fallback)
 """
 
+import argparse
 import math, os, signal, sqlite3, sys, tarfile, time, threading
 import concurrent.futures
 import io
@@ -30,8 +31,9 @@ import moderngl
 from PIL import Image, ImageDraw, ImageFont
 
 # ── Dataset constants ────────────────────────────────────────────────
-FILENAME = '/data-pool/tor/tiny/data/tiny_images.bin'
-METAFILE = '/data-pool/tor/tiny/data/tiny_metadata.bin'
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR    = os.path.join(_SCRIPT_DIR, 'data')
+
 NUM_IMAGES = 79302017
 IMG = 32
 CH = 3
@@ -40,8 +42,6 @@ META_REC = 768          # bytes per metadata record
 META_KW_LEN = 80        # keyword field width
 ORDER = 14
 SIDE = 1 << ORDER          # 16384
-AVG_CACHE  = os.path.join(os.path.dirname(FILENAME), 'avg_colors.npy')
-GRID_CACHE = os.path.join(os.path.dirname(FILENAME), 'hilbert_avg_grid.npy')
 
 
 # ── Hilbert curve (numpy-vectorized) ─────────────────────────────────
@@ -128,8 +128,6 @@ STATUS_CODES = {
     'error': 5, 'dns': 6, 'no_url': 7, 'not_image': 8,
 }
 STATUS_NAMES = {v: k for k, v in STATUS_CODES.items()}
-LINK_CACHE = os.path.join(os.path.dirname(FILENAME), 'link_status.bin')
-FETCH_DIR = os.path.join(os.path.dirname(FILENAME), 'fetched')
 FETCH_MAX_SIZE = 512
 FETCH_SHARD_MAX = 1 << 31             # 2 GB per tar shard
 FETCH_MIN_PPI = 16
@@ -309,19 +307,19 @@ def _scatter_avg_to_grid(avg):
     return grid
 
 
-def load_or_build_grid(data):
+def load_or_build_grid(data, grid_cache, avg_cache):
     """Load the SIDE×SIDE×3 Hilbert avg-colour grid, building it if needed."""
-    if os.path.exists(GRID_CACHE):
+    if os.path.exists(grid_cache):
         print("Loading cached Hilbert avg grid …")
-        return np.load(GRID_CACHE)
+        return np.load(grid_cache)
 
     # fast path: build from per-image avg cache (no dataset scan)
-    if os.path.exists(AVG_CACHE):
+    if os.path.exists(avg_cache):
         print("Building Hilbert avg grid from avg cache …")
-        avg = np.load(AVG_CACHE)
+        avg = np.load(avg_cache)
         grid = _scatter_avg_to_grid(avg)
-        np.save(GRID_CACHE, grid)
-        print(f"Saved to {GRID_CACHE}")
+        np.save(grid_cache, grid)
+        print(f"Saved to {grid_cache}")
         return grid
 
     # slow path: compute averages from raw dataset
@@ -339,8 +337,8 @@ def load_or_build_grid(data):
     print()
     print("Scattering into Hilbert grid …")
     grid = _scatter_avg_to_grid(avg)
-    np.save(GRID_CACHE, grid)
-    print(f"Saved to {GRID_CACHE}")
+    np.save(grid_cache, grid)
+    print(f"Saved to {grid_cache}")
     return grid
 
 
@@ -377,7 +375,16 @@ class Viewer:
         except OSError:
             pass
 
-    def __init__(self):
+    def __init__(self, data_dir=None):
+        # resolve data paths
+        dd = data_dir or DATA_DIR
+        self._filename  = os.path.join(dd, 'tiny_images.bin')
+        self._metafile  = os.path.join(dd, 'tiny_metadata.bin')
+        self._avg_cache = os.path.join(dd, 'avg_colors.npy')
+        self._grid_cache = os.path.join(dd, 'hilbert_avg_grid.npy')
+        self._link_cache = os.path.join(dd, 'link_status.bin')
+        self._fetch_dir = os.path.join(dd, 'fetched')
+
         # view state
         self.w, self.h = 1920, 1080
         self.cx = SIDE / 2.0
@@ -438,11 +445,12 @@ class Viewer:
         )
 
         # ── data ──
-        print(f"Memory-mapping {FILENAME} …")
-        self.data = np.memmap(FILENAME, dtype='uint8', mode='r',
+        print(f"Memory-mapping {self._filename} …")
+        self.data = np.memmap(self._filename, dtype='uint8', mode='r',
                               shape=(NUM_IMAGES, CH, IMG, IMG))
 
-        avg_grid = load_or_build_grid(self.data)
+        avg_grid = load_or_build_grid(self.data, self._grid_cache,
+                                      self._avg_cache)
         self.avg_tex = self.ctx.texture((SIDE, SIDE), 3, avg_grid.tobytes())
         del avg_grid
         self.avg_tex.build_mipmaps()
@@ -452,7 +460,7 @@ class Viewer:
         self._dummy = self.ctx.texture((1, 1), 3, b'\x00\x00\x00')
 
         # ── metadata ──
-        self.meta = np.memmap(METAFILE, dtype='uint8', mode='r',
+        self.meta = np.memmap(self._metafile, dtype='uint8', mode='r',
                               shape=(NUM_IMAGES, META_REC))
         self._hover_idx = -1      # image index under cursor
 
@@ -480,11 +488,11 @@ class Viewer:
         self._show_dots = True
 
         # persistent link status (mmap'd byte array)
-        if not os.path.exists(LINK_CACHE):
-            fp = np.memmap(LINK_CACHE, dtype='uint8', mode='w+',
+        if not os.path.exists(self._link_cache):
+            fp = np.memmap(self._link_cache, dtype='uint8', mode='w+',
                            shape=(NUM_IMAGES,))
             del fp
-        self._link_status = np.memmap(LINK_CACHE, dtype='uint8', mode='r+',
+        self._link_status = np.memmap(self._link_cache, dtype='uint8', mode='r+',
                                       shape=(NUM_IMAGES,))
         self._link_checks = {}
         snapshot = np.array(self._link_status)   # copy — nonzero on mmap can race
@@ -507,13 +515,13 @@ class Viewer:
         self._dim_mode = False
 
         # instance lock (protects tar shards from concurrent writes)
-        self._lock_path = os.path.join(FETCH_DIR, 'viewer.pid')
-        os.makedirs(FETCH_DIR, exist_ok=True)
+        self._lock_path = os.path.join(self._fetch_dir, 'viewer.pid')
+        os.makedirs(self._fetch_dir, exist_ok=True)
         self._acquire_lock()
 
         # fetched image cache (tar shards + SQLite index)
         self._fetch_db = sqlite3.connect(
-            os.path.join(FETCH_DIR, 'index.db'), check_same_thread=False)
+            os.path.join(self._fetch_dir, 'index.db'), check_same_thread=False)
         self._fetch_db.execute('PRAGMA journal_mode=WAL')
         self._fetch_db.execute('''CREATE TABLE IF NOT EXISTS images (
             idx INTEGER PRIMARY KEY,
@@ -541,11 +549,11 @@ class Viewer:
         self._shard_dirty = 0
         self._shard_tf = None   # persistent tarfile handle
         shard_files = sorted(
-            f for f in os.listdir(FETCH_DIR)
+            f for f in os.listdir(self._fetch_dir)
             if f.startswith('shard_') and f.endswith('.tar'))
         if shard_files:
             self._shard_num = int(shard_files[-1].split('_')[1].split('.')[0])
-            if os.path.getsize(os.path.join(FETCH_DIR, shard_files[-1])) >= FETCH_SHARD_MAX:
+            if os.path.getsize(os.path.join(self._fetch_dir, shard_files[-1])) >= FETCH_SHARD_MAX:
                 self._shard_num += 1
         else:
             self._shard_num = 0
@@ -885,7 +893,7 @@ class Viewer:
             'SELECT DISTINCT shard FROM images WHERE offset IS NULL').fetchall()
         total = 0
         for (shard_name,) in rows:
-            shard_path = os.path.join(FETCH_DIR, shard_name)
+            shard_path = os.path.join(self._fetch_dir, shard_name)
             if not os.path.exists(shard_path):
                 continue
             with tarfile.open(shard_path, 'r') as tf:
@@ -908,7 +916,7 @@ class Viewer:
         if self._shard_tf is not None:
             self._shard_tf.close()
         shard = f"shard_{self._shard_num:06d}.tar"
-        path = os.path.join(FETCH_DIR, shard)
+        path = os.path.join(self._fetch_dir, shard)
         self._shard_tf = tarfile.open(path, 'a')
         return shard
 
@@ -953,7 +961,7 @@ class Viewer:
         if row is None:
             return None
         shard_name, offset, size = row
-        shard_path = os.path.join(FETCH_DIR, shard_name)
+        shard_path = os.path.join(self._fetch_dir, shard_name)
         if offset is None or size is None:
             return None
         try:
@@ -1750,4 +1758,9 @@ class Viewer:
 
 
 if __name__ == '__main__':
-    Viewer().run()
+    parser = argparse.ArgumentParser(
+        description='Interactive viewer for the 80 Million Tiny Images dataset')
+    parser.add_argument('--data-dir', default=None,
+                        help=f'Path to data directory (default: {DATA_DIR})')
+    args = parser.parse_args()
+    Viewer(data_dir=args.data_dir).run()
