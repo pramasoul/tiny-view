@@ -2149,8 +2149,8 @@ if __name__ == '__main__':
     parser.add_argument('-q', '--quiet', action='store_true',
                         help='Suppress all output except fatal errors')
     parser.add_argument('--layout', choices=['hilbert', 'gilbert'],
-                        default='hilbert',
-                        help='Space-filling curve layout (default: hilbert)')
+                        default='gilbert',
+                        help='Space-filling curve layout (default: gilbert)')
     args = parser.parse_args()
     Viewer(data_dir=args.data_dir, verbose=args.verbose,
            quiet=args.quiet, layout=args.layout).run()
