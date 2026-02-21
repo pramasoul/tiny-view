@@ -942,10 +942,12 @@ class Viewer:
         """Open (or reopen) the current shard tar for appending.
 
         If the tar is corrupt (e.g. from a crash mid-write), truncate
-        back to the last complete entry and retry.
+        to the last complete entry and write a proper end-of-archive
+        marker (two 512-byte zero blocks) so tarfile can reopen it.
         """
         if self._shard_tf is not None:
             self._shard_tf.close()
+            self._shard_tf = None
         shard = f"shard_{self._shard_num:06d}.tar"
         path = os.path.join(self._fetch_dir, shard)
         try:
@@ -956,23 +958,31 @@ class Viewer:
         return shard
 
     def _repair_shard(self, path):
-        """Truncate a corrupt tar back to the last complete entry."""
-        size = os.path.getsize(path)
+        """Truncate a corrupt tar to the last complete entry and re-terminate it."""
+        file_size = os.path.getsize(path)
         safe = 0
-        try:
-            with tarfile.open(path, 'r') as tf:
-                for member in tf:
-                    end = member.offset + 512 + ((member.size + 511) // 512) * 512
-                    if end > size:
-                        break
-                    safe = end
-        except tarfile.ReadError:
-            pass
-        if safe < size:
-            print(f"Repairing {path}: truncating from {size} to {safe} "
-                  f"({(size - safe)} bytes removed)", flush=True)
-            with open(path, 'r+b') as f:
-                f.truncate(safe)
+        with open(path, 'rb') as f:
+            while True:
+                header = f.read(512)
+                if len(header) < 512 or header == b'\x00' * 512:
+                    break  # EOF or end-of-archive marker
+                try:
+                    info = tarfile.TarInfo.frombuf(header, tarfile.ENCODING,
+                                                   'surrogateescape')
+                except tarfile.HeaderError:
+                    break  # corrupt header
+                data_blocks = (info.size + 511) // 512
+                entry_end = f.tell() + data_blocks * 512
+                if entry_end > file_size:
+                    break  # data truncated
+                f.seek(data_blocks * 512, 1)
+                safe = entry_end
+        print(f"Repairing {path}: truncating to {safe} and re-terminating "
+              f"({file_size - safe} bytes removed)", flush=True)
+        with open(path, 'r+b') as f:
+            f.seek(safe)
+            f.write(b'\x00' * 1024)  # two 512-byte end-of-archive blocks
+            f.truncate()
 
     def _save_fetched(self, idx, img):
         """Save a fetched PIL image to the current tar shard. Returns True on success."""
