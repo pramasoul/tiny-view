@@ -352,6 +352,31 @@ class Viewer:
         ppi = 0.9 * min(w / SIDE, h / SIDE)
         return math.log2(max(ppi, 2 ** (MIN_ZOOM + 5))) - 5
 
+    def _acquire_lock(self):
+        """Prevent multiple instances from corrupting tar shards."""
+        if os.path.exists(self._lock_path):
+            try:
+                old_pid = int(open(self._lock_path).read().strip())
+                os.kill(old_pid, 0)   # check if alive (signal 0 = no-op)
+                print(f"Another viewer is running (PID {old_pid}).\n"
+                      f"If this is wrong, delete {self._lock_path}",
+                      file=sys.stderr, flush=True)
+                sys.exit(1)
+            except (ValueError, ProcessLookupError):
+                pass   # stale lock from a crash — take over
+            except PermissionError:
+                pass   # process exists but owned by another user — unlikely
+        with open(self._lock_path, 'w') as f:
+            f.write(str(os.getpid()))
+
+    def _release_lock(self):
+        try:
+            if (os.path.exists(self._lock_path)
+                    and open(self._lock_path).read().strip() == str(os.getpid())):
+                os.remove(self._lock_path)
+        except OSError:
+            pass
+
     def __init__(self):
         # view state
         self.w, self.h = 1920, 1080
@@ -481,8 +506,12 @@ class Viewer:
         # dim mode — darken everything except fetched overlays
         self._dim_mode = False
 
-        # fetched image cache (tar shards + SQLite index)
+        # instance lock (protects tar shards from concurrent writes)
+        self._lock_path = os.path.join(FETCH_DIR, 'viewer.pid')
         os.makedirs(FETCH_DIR, exist_ok=True)
+        self._acquire_lock()
+
+        # fetched image cache (tar shards + SQLite index)
         self._fetch_db = sqlite3.connect(
             os.path.join(FETCH_DIR, 'index.db'), check_same_thread=False)
         self._fetch_db.execute('PRAGMA journal_mode=WAL')
@@ -1716,6 +1745,7 @@ class Viewer:
             self._fetch_db.commit()
             self._fetch_db.close()
             self._link_pool.shutdown(wait=False, cancel_futures=True)
+            self._release_lock()
             glfw.terminate()
 
 
