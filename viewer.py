@@ -530,15 +530,20 @@ class Viewer:
         self._fetched_lock = threading.Lock()
         self._fetched_textures = {}   # idx → (texture, gx, gy) — only visible
         self._fetched_loading = set() # idx currently being loaded from cache
-        # index of all cached images: idx → (gx, gy)
+        # index of all cached images (numpy arrays + set for O(1) lookup)
         all_cached = [r[0] for r in self._fetch_db.execute('SELECT idx FROM images')]
         if all_cached:
             arr = np.array(all_cached, dtype=np.int64)
             gx, gy = hilbert_d2xy(ORDER, arr)
-            self._fetched_index = {int(i): (int(x), int(y))
-                                   for i, x, y in zip(all_cached, gx, gy)}
+            self._fi_idx = arr
+            self._fi_gx = gx.astype(np.int32)
+            self._fi_gy = gy.astype(np.int32)
+            self._fi_set = set(int(i) for i in all_cached)
         else:
-            self._fetched_index = {}
+            self._fi_idx = np.empty(0, dtype=np.int64)
+            self._fi_gx = np.empty(0, dtype=np.int32)
+            self._fi_gy = np.empty(0, dtype=np.int32)
+            self._fi_set = set()
 
         # dot shader + cached dot buffer
         self._dot_prog = self.ctx.program(
@@ -944,7 +949,7 @@ class Viewer:
             if not url.startswith(('http://', 'https://')):
                 url = 'http://' + url
             self._fetch_image(idx, url)
-            if idx not in self._fetched_index:
+            if idx not in self._fi_set:
                 self._fetched_loading.discard(idx)
             return
         gx, gy = hilbert_d2xy(ORDER, np.int64(idx))
@@ -1336,8 +1341,13 @@ class Viewer:
             self._fetched_queue.clear()
         if not queue:
             return False
+        new_idx, new_gx, new_gy = [], [], []
         for idx, gx, gy, pixels in queue:
-            self._fetched_index[idx] = (gx, gy)
+            if idx not in self._fi_set:
+                self._fi_set.add(idx)
+                new_idx.append(idx)
+                new_gx.append(gx)
+                new_gy.append(gy)
             self._fetched_loading.discard(idx)
             h, w = pixels.shape[:2]
             tex = self.ctx.texture((w, h), 3, pixels.tobytes())
@@ -1346,6 +1356,13 @@ class Viewer:
             if idx in self._fetched_textures:
                 self._fetched_textures[idx][0].release()
             self._fetched_textures[idx] = (tex, gx, gy)
+        if new_idx:
+            self._fi_idx = np.concatenate([self._fi_idx,
+                                           np.array(new_idx, dtype=np.int64)])
+            self._fi_gx = np.concatenate([self._fi_gx,
+                                          np.array(new_gx, dtype=np.int32)])
+            self._fi_gy = np.concatenate([self._fi_gy,
+                                          np.array(new_gy, dtype=np.int32)])
         return True
 
     _DOT_STRIDE = 20  # 5 floats × 4 bytes: gx, gy, r, g, b
@@ -1410,13 +1427,15 @@ class Viewer:
             else:
                 new_dots.append(idx)
 
-        # Color updates: write 12 bytes (r,g,b) at each dot's slot
+        # Color updates: batch compute colors, individual GPU writes
         if color_updates:
-            for idx in color_updates:
+            upd_arr = np.array(color_updates, dtype=np.int64)
+            codes = self._link_status[upd_arr]
+            colors = STATUS_COLORS_LUT[codes].astype('f4')
+            for i, idx in enumerate(color_updates):
                 slot = self._dot_pos[idx]
-                code = self._link_status[idx]
-                rgb = np.array(STATUS_COLORS_LUT[code], dtype='f4')
-                self._dot_buf.write(rgb.tobytes(), offset=slot * self._DOT_STRIDE + 8)
+                self._dot_buf.write(colors[i].tobytes(),
+                                    offset=slot * self._DOT_STRIDE + 8)
 
         # New dots: compute positions, append to buffer
         if new_dots:
@@ -1458,15 +1477,18 @@ class Viewer:
             if not (ex0 <= gx <= ex1 and ey0 <= gy <= ey1):
                 self._fetched_textures[idx][0].release()
                 del self._fetched_textures[idx]
-        # load visible cached images that lack textures
+        # load visible cached images that lack textures (vectorized scan)
         submitted = False
-        for idx, (gx, gy) in self._fetched_index.items():
-            if (gx0 <= gx <= gx1 and gy0 <= gy <= gy1
-                    and idx not in self._fetched_textures
-                    and idx not in self._fetched_loading):
-                self._fetched_loading.add(idx)
-                self._link_pool.submit(self._reload_one, idx)
-                submitted = True
+        if len(self._fi_idx) > 0:
+            vis = ((self._fi_gx >= gx0) & (self._fi_gx <= gx1) &
+                   (self._fi_gy >= gy0) & (self._fi_gy <= gy1))
+            for idx_i in self._fi_idx[vis]:
+                idx = int(idx_i)
+                if (idx not in self._fetched_textures
+                        and idx not in self._fetched_loading):
+                    self._fetched_loading.add(idx)
+                    self._link_pool.submit(self._reload_one, idx)
+                    submitted = True
         # also retry ok images not in cache (e.g. checked before fetch existed)
         ok_code = STATUS_CODES['ok']
         vgx = np.arange(max(0, gx0), min(SIDE, gx1), dtype=np.int64)
@@ -1477,7 +1499,7 @@ class Viewer:
             vidx = vidx[vidx < NUM_IMAGES]
             for i in vidx[self._link_status[vidx] == ok_code]:
                 idx = int(i)
-                if (idx not in self._fetched_index
+                if (idx not in self._fi_set
                         and idx not in self._fetched_textures
                         and idx not in self._fetched_loading):
                     self._fetched_loading.add(idx)
