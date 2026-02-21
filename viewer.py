@@ -487,8 +487,24 @@ class Viewer:
             idx INTEGER PRIMARY KEY,
             shard TEXT NOT NULL,
             width INTEGER NOT NULL,
-            height INTEGER NOT NULL)''')
+            height INTEGER NOT NULL,
+            offset INTEGER,
+            size INTEGER)''')
+        # add offset/size columns if upgrading from old schema
+        try:
+            self._fetch_db.execute('ALTER TABLE images ADD COLUMN offset INTEGER')
+        except sqlite3.OperationalError:
+            pass  # column already exists
+        try:
+            self._fetch_db.execute('ALTER TABLE images ADD COLUMN size INTEGER')
+        except sqlite3.OperationalError:
+            pass  # column already exists
         self._fetch_db.commit()
+        # migrate: populate offset/size for old rows that lack them
+        need_migrate = self._fetch_db.execute(
+            'SELECT COUNT(*) FROM images WHERE offset IS NULL').fetchone()[0]
+        if need_migrate:
+            self._migrate_offsets()
         self._shard_lock = threading.Lock()
         self._shard_dirty = 0
         self._shard_tf = None   # persistent tarfile handle
@@ -762,6 +778,30 @@ class Viewer:
         except Exception as e:
             print(f"  fetch #{idx} FAILED: {e}", flush=True)
 
+    def _migrate_offsets(self):
+        """One-time migration: scan tar shards to populate offset/size."""
+        rows = self._fetch_db.execute(
+            'SELECT DISTINCT shard FROM images WHERE offset IS NULL').fetchall()
+        total = 0
+        for (shard_name,) in rows:
+            shard_path = os.path.join(FETCH_DIR, shard_name)
+            if not os.path.exists(shard_path):
+                continue
+            with tarfile.open(shard_path, 'r') as tf:
+                for member in tf.getmembers():
+                    name = member.name.replace('.jpg', '')
+                    try:
+                        idx = int(name)
+                    except ValueError:
+                        continue
+                    self._fetch_db.execute(
+                        'UPDATE images SET offset=?, size=? WHERE idx=? AND offset IS NULL',
+                        (member.offset_data, member.size, idx))
+                    total += 1
+        self._fetch_db.commit()
+        if total:
+            print(f"Migrated {total} cache entries with byte offsets", flush=True)
+
     def _open_shard(self):
         """Open (or reopen) the current shard tar for appending."""
         if self._shard_tf is not None:
@@ -788,6 +828,7 @@ class Viewer:
                     shard = f"shard_{self._shard_num:06d}.tar"
                 info = tarfile.TarInfo(name=f"{idx:010d}.jpg")
                 info.size = len(jpeg_data)
+                data_offset = self._shard_tf.fileobj.tell() + 512  # header is 512 bytes
                 self._shard_tf.addfile(info, io.BytesIO(jpeg_data))
                 # Check shard size, rotate if needed
                 pos = self._shard_tf.fileobj.tell()
@@ -795,8 +836,8 @@ class Viewer:
                     self._shard_num += 1
                     shard = self._open_shard()
                 self._fetch_db.execute(
-                    'INSERT INTO images (idx, shard, width, height) VALUES (?,?,?,?)',
-                    (idx, shard, w, h))
+                    'INSERT INTO images (idx, shard, width, height, offset, size) VALUES (?,?,?,?,?,?)',
+                    (idx, shard, w, h, data_offset, len(jpeg_data)))
                 self._shard_dirty += 1
                 if self._shard_dirty >= 50:
                     self._fetch_db.commit()
@@ -807,15 +848,17 @@ class Viewer:
     def _load_fetched(self, idx):
         """Load a fetched image from the tar cache. Returns pixels array or None."""
         row = self._fetch_db.execute(
-            'SELECT shard FROM images WHERE idx=?', (idx,)).fetchone()
+            'SELECT shard, offset, size FROM images WHERE idx=?', (idx,)).fetchone()
         if row is None:
             return None
-        shard_path = os.path.join(FETCH_DIR, row[0])
-        if not os.path.exists(shard_path):
+        shard_name, offset, size = row
+        shard_path = os.path.join(FETCH_DIR, shard_name)
+        if offset is None or size is None:
             return None
         try:
-            with tarfile.open(shard_path, 'r') as tf:
-                data = tf.extractfile(f"{idx:010d}.jpg").read()
+            with open(shard_path, 'rb') as f:
+                f.seek(offset)
+                data = f.read(size)
             img = Image.open(io.BytesIO(data)).convert('RGB')
             return np.asarray(img, dtype='uint8').copy()
         except Exception as e:
