@@ -758,6 +758,7 @@ class Viewer:
                     self._link_checks[idx] = 'not_image'
                     self._link_status[idx] = STATUS_CODES['not_image']
                 self._link_dirty = True
+                self._fetched_loading.discard(idx)
                 return
             raw = resp.read(16 * 1024 * 1024)  # 16 MB cap
             print(f"  fetch #{idx} got {len(raw)} bytes", flush=True)
@@ -777,6 +778,7 @@ class Viewer:
             self._link_dirty = True
         except Exception as e:
             print(f"  fetch #{idx} FAILED: {e}", flush=True)
+            self._fetched_loading.discard(idx)
 
     def _migrate_offsets(self):
         """One-time migration: scan tar shards to populate offset/size."""
@@ -872,10 +874,13 @@ class Viewer:
             meta = self._read_meta(idx)
             url = meta['source_url'].strip('\x00 ')
             if not url:
+                self._fetched_loading.discard(idx)
                 return
             if not url.startswith(('http://', 'https://')):
                 url = 'http://' + url
             self._fetch_image(idx, url)
+            if idx not in self._fetched_index:
+                self._fetched_loading.discard(idx)
             return
         gx, gy = hilbert_d2xy(ORDER, np.int64(idx))
         with self._fetched_lock:
@@ -1243,28 +1248,23 @@ class Viewer:
                 int(self.cx + hw) + margin + 1, int(self.cy + hh) + margin + 1)
 
     def _upload_pending_fetches(self):
-        """Upload queued fetched images — only if visible, else just index them."""
+        """Upload queued fetched images to GPU textures."""
         with self._fetched_lock:
             queue = list(self._fetched_queue)
             self._fetched_queue.clear()
         if not queue:
             return False
-        gx0, gy0, gx1, gy1 = self._visible_rect()
-        show = self.ppi >= FETCH_MIN_PPI
-        uploaded = False
         for idx, gx, gy, pixels in queue:
             self._fetched_index[idx] = (gx, gy)
             self._fetched_loading.discard(idx)
-            if show and gx0 <= gx <= gx1 and gy0 <= gy <= gy1:
-                h, w = pixels.shape[:2]
-                tex = self.ctx.texture((w, h), 3, pixels.tobytes())
-                tex.build_mipmaps()
-                tex.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
-                if idx in self._fetched_textures:
-                    self._fetched_textures[idx][0].release()
-                self._fetched_textures[idx] = (tex, gx, gy)
-                uploaded = True
-        return uploaded
+            h, w = pixels.shape[:2]
+            tex = self.ctx.texture((w, h), 3, pixels.tobytes())
+            tex.build_mipmaps()
+            tex.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
+            if idx in self._fetched_textures:
+                self._fetched_textures[idx][0].release()
+            self._fetched_textures[idx] = (tex, gx, gy)
+        return True
 
     def _rebuild_dots(self):
         """Rebuild dot buffer. Caches grid positions, vectorizes colors."""
@@ -1320,21 +1320,42 @@ class Viewer:
                     tex.release()
                 self._fetched_textures.clear()
                 self._dirty = True
+            self._fetched_loading.clear()
             return
         gx0, gy0, gx1, gy1 = self._visible_rect()
-        # evict off-screen
+        # evict off-screen (wider margin to avoid load/evict churn)
+        ex0, ey0, ex1, ey1 = self._visible_rect(margin=16)
         for idx in list(self._fetched_textures):
             _, gx, gy = self._fetched_textures[idx]
-            if not (gx0 <= gx <= gx1 and gy0 <= gy <= gy1):
+            if not (ex0 <= gx <= ex1 and ey0 <= gy <= ey1):
                 self._fetched_textures[idx][0].release()
                 del self._fetched_textures[idx]
         # load visible cached images that lack textures
+        submitted = False
         for idx, (gx, gy) in self._fetched_index.items():
             if (gx0 <= gx <= gx1 and gy0 <= gy <= gy1
                     and idx not in self._fetched_textures
                     and idx not in self._fetched_loading):
                 self._fetched_loading.add(idx)
                 self._link_pool.submit(self._reload_one, idx)
+                submitted = True
+        # also retry ok images not in cache (e.g. checked before fetch existed)
+        ok_code = STATUS_CODES['ok']
+        vgx = np.arange(max(0, gx0), min(SIDE, gx1), dtype=np.int64)
+        vgy = np.arange(max(0, gy0), min(SIDE, gy1), dtype=np.int64)
+        if len(vgx) > 0 and len(vgy) > 0:
+            mgx, mgy = np.meshgrid(vgx, vgy)
+            vidx = hilbert_xy2d(ORDER, mgx.ravel(), mgy.ravel())
+            for i in vidx[self._link_status[vidx] == ok_code]:
+                idx = int(i)
+                if (idx not in self._fetched_index
+                        and idx not in self._fetched_textures
+                        and idx not in self._fetched_loading):
+                    self._fetched_loading.add(idx)
+                    self._link_pool.submit(self._reload_one, idx)
+                    submitted = True
+        if submitted:
+            self._dirty = True
 
     # ── render ────────────────────────────────────────────────────────
     def _render(self):
