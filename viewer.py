@@ -16,6 +16,7 @@ Controls:
   C          toggle Hilbert crawl from hovered image
   D          dim all except fetched images (find live sources)
   R          reload ok images from cache (or network fallback)
+  P          toggle hi-res preview popup
 """
 
 import argparse
@@ -387,7 +388,7 @@ class Viewer:
         self._init_shard_cache()   # fetch_dir, sqlite, tar shards, fi_* arrays
         self._init_crawl()         # crawl threads, status line state
         self._log(f"Hilbert grid {SIDE}×{SIDE} (order {ORDER}) = {NUM_IMAGES:,} images")
-        self._log("Scroll=zoom  Drag=pan  Click=check  C=crawl  D=dim  R=reload  F=full  M=meta  H=help  L=dots  /=search  Esc/Q=quit")
+        self._log("Scroll=zoom  Drag=pan  Click=check  C=crawl  D=dim  R=reload  P=preview  F=full  M=meta  H=help  L=dots  /=search  Esc/Q=quit")
 
     def _log(self, msg):
         if not self._quiet:
@@ -490,6 +491,11 @@ class Viewer:
         self._help_tex = None
         self._help_tw = 0
         self._help_th = 0
+        self._show_preview = False
+        self._preview_tex = None
+        self._preview_idx = -1
+        self._preview_tw = 0
+        self._preview_th = 0
 
         self._overlay_prog = self.ctx.program(
             vertex_shader=OVERLAY_VERT, fragment_shader=OVERLAY_FRAG)
@@ -744,6 +750,7 @@ class Viewer:
             "D          dim all except fetched images",
             "C          toggle Hilbert crawl from cursor",
             "R          reload ok images from cache/network",
+            "P          toggle hi-res preview popup",
             "/          search keywords",
             "Home       reset view",
             "Esc        windowed (if fullscreen) / quit",
@@ -1210,7 +1217,7 @@ class Viewer:
             self._dirty = True
             self._viewport_changed = True
         self._update_title(x, y)
-        if self._show_meta or self._show_help:
+        if self._show_meta or self._show_help or self._show_preview:
             self._dirty = True
 
     def _on_char(self, _win, codepoint):
@@ -1288,6 +1295,13 @@ class Viewer:
             self._dirty = True
         elif key == glfw.KEY_R:
             self._reload_ok_images()
+            self._dirty = True
+        elif key == glfw.KEY_P:
+            self._show_preview = not self._show_preview
+            if not self._show_preview and self._preview_tex is not None:
+                self._preview_tex.release()
+                self._preview_tex = None
+                self._preview_idx = -1
             self._dirty = True
 
     # ── fullscreen ───────────────────────────────────────────────────
@@ -1670,6 +1684,7 @@ class Viewer:
         self._render_ok_cells()
         self._render_fetched()
         self._render_dots()
+        self._render_preview()
         self._render_info_overlay()
 
     def _render_base_map(self):
@@ -1773,6 +1788,51 @@ class Viewer:
         self._dot_prog['u_square'].value = 0
         self._dot_vao.render(moderngl.POINTS, vertices=self._dot_n)
         self.ctx.disable(moderngl.BLEND | moderngl.PROGRAM_POINT_SIZE)
+
+    def _render_preview(self):
+        """Draw hi-res preview popup at full resolution near cursor."""
+        if not self._show_preview or self.ppi < DETAIL_MIN_PPI:
+            return
+        idx = self._hover_idx
+        if idx < 0 or idx not in self._fi_set:
+            if self._preview_tex is not None:
+                self._preview_tex.release()
+                self._preview_tex = None
+                self._preview_idx = -1
+            return
+        # build / update preview texture
+        if idx != self._preview_idx:
+            if self._preview_tex is not None:
+                self._preview_tex.release()
+                self._preview_tex = None
+            pixels = self._load_fetched(idx)
+            if pixels is None:
+                self._preview_idx = -1
+                return
+            h, w = pixels.shape[:2]
+            tex = self.ctx.texture((w, h), 3, pixels.tobytes())
+            tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+            self._preview_tex = tex
+            self._preview_tw = w
+            self._preview_th = h
+            self._preview_idx = idx
+        # position: bottom-right corner of popup anchored left-and-up from cursor
+        mx, my = glfw.get_cursor_pos(self.win)
+        tw, th = self._preview_tw, self._preview_th
+        ox = mx - META_OFFSET[0] - tw
+        oy = my - META_OFFSET[1] - th
+        # clamp to screen
+        ox = max(0, min(ox, self.w - tw))
+        oy = max(0, min(oy, self.h - th))
+        # convert screen coords (y-down) to NDC (y-up)
+        x0 = 2.0 * ox / self.w - 1.0
+        x1 = 2.0 * (ox + tw) / self.w - 1.0
+        y0 = 1.0 - 2.0 * (oy + th) / self.h
+        y1 = 1.0 - 2.0 * oy / self.h
+        self._preview_tex.use(0)
+        self._overlay_prog['u_tex'].value = 0
+        self._overlay_prog['u_rect'].value = (x0, y0, x1, y1)
+        self._overlay_vao.render(moderngl.TRIANGLE_STRIP)
 
     def _render_info_overlay(self):
         """Draw metadata or help overlay on top of everything."""
