@@ -13,7 +13,7 @@ Controls:
   Click      check source URL (shows colored dot)
   H          toggle help overlay
   L          toggle link-check dots and fetched overlays
-  C          toggle Hilbert crawl from hovered image
+  C          toggle curve crawl from hovered image
   D          dim all except fetched images (find live sources)
   R          reload ok images from cache (or network fallback)
   P          toggle hi-res preview popup
@@ -43,6 +43,10 @@ META_REC = 768          # bytes per metadata record
 META_KW_LEN = 80        # keyword field width
 ORDER = 14
 SIDE = 1 << ORDER          # 16384
+
+GIL_W = 12041
+GIL_H = 6586
+GIL_CELLS = GIL_W * GIL_H   # 79,302,026
 
 
 # ── Hilbert curve (numpy-vectorized) ─────────────────────────────────
@@ -93,6 +97,60 @@ def hilbert_xy2d(order, x, y):
         np.copyto(y, s - 1 - y, where=flip)
         s >>= 1
     return d
+
+# ── Gilbert curve generator (Cerveny's algorithm, BSD-2-Clause) ──────
+def _gilbert2d_gen(x, y, ax, ay, bx, by):
+    """Recursive generator yielding (col, row) along a Gilbert curve.
+
+    Adapted from Jakub Cerveny's ``gilbert`` reference implementation
+    (BSD-2-Clause).  Recursion depth is O(log2(max(W,H))) ≈ 14.
+    """
+    w = abs(ax + ay)
+    h = abs(bx + by)
+
+    dax = 1 if ax > 0 else (-1 if ax < 0 else 0)
+    day = 1 if ay > 0 else (-1 if ay < 0 else 0)
+    dbx = 1 if bx > 0 else (-1 if bx < 0 else 0)
+    dby = 1 if by > 0 else (-1 if by < 0 else 0)
+
+    if h == 1:
+        for _ in range(w):
+            yield (x, y)
+            x += dax
+            y += day
+        return
+
+    if w == 1:
+        for _ in range(h):
+            yield (x, y)
+            x += dbx
+            y += dby
+        return
+
+    ax2 = ax // 2
+    ay2 = ay // 2
+    bx2 = bx // 2
+    by2 = by // 2
+
+    w2 = abs(ax2 + ay2)
+    h2 = abs(bx2 + by2)
+
+    if 2 * w > 3 * h:
+        if (w2 & 1) and (w > 2):
+            ax2 += dax
+            ay2 += day
+        yield from _gilbert2d_gen(x, y, ax2, ay2, bx, by)
+        yield from _gilbert2d_gen(x + ax2, y + ay2, ax - ax2, ay - ay2, bx, by)
+    else:
+        if (h2 & 1) and (h > 2):
+            bx2 += dbx
+            by2 += dby
+        yield from _gilbert2d_gen(x, y, bx2, by2, ax2, ay2)
+        yield from _gilbert2d_gen(x + bx2, y + by2, ax, ay, bx - bx2, by - by2)
+        yield from _gilbert2d_gen(x + (ax - dax) + (bx2 - dbx),
+                                  y + (ay - day) + (by2 - dby),
+                                  -bx2, -by2, -(ax - ax2), -(ay - ay2))
+
 
 MIN_ZOOM = -18.0  # whole grid → ~1 px (Powers of Ten)
 MAX_ZOOM =  5.0   # 32 display-px per image-px
@@ -291,6 +349,56 @@ void main() {
 """
 
 
+# ── Gilbert table builder + cache ────────────────────────────────────
+def _build_gilbert_tables(w, h, cache_dir):
+    """Build or load Gilbert d2xy / xy2d lookup tables.
+
+    Returns (d2xy_x, d2xy_y, xy2d) — int32 arrays.
+    First run iterates the generator (~1-2 min for 79M cells), then caches
+    as .npy files.  Subsequent runs mmap the cache (~instant).
+    """
+    n = w * h
+    d2xy_path = os.path.join(cache_dir, f'gilbert_{w}x{h}_d2xy.npy')
+    xy2d_path = os.path.join(cache_dir, f'gilbert_{w}x{h}_xy2d.npy')
+
+    if os.path.exists(d2xy_path) and os.path.exists(xy2d_path):
+        d2xy = np.load(d2xy_path, mmap_mode='r')
+        d2xy_x = d2xy[:, 0]
+        d2xy_y = d2xy[:, 1]
+        xy2d = np.load(xy2d_path, mmap_mode='r')
+        return d2xy_x, d2xy_y, xy2d
+
+    print(f"Building Gilbert {w}x{h} tables (one-time, ~1-2 min) …")
+    d2xy = np.empty((n, 2), dtype=np.int32)
+    t0 = time.time()
+    for i, (cx, cy) in enumerate(_gilbert2d_gen(0, 0, w, 0, 0, h)):
+        d2xy[i, 0] = cx
+        d2xy[i, 1] = cy
+        if i % 5_000_000 == 0 and i > 0:
+            elapsed = time.time() - t0
+            pct = 100 * i / n
+            eta = elapsed / pct * (100 - pct) if pct > 0 else 0
+            print(f"\r  {pct:5.1f}%  ETA {eta:.0f}s", end='', flush=True)
+    print(f"\r  100.0%  ({time.time() - t0:.1f}s)    ")
+
+    # verify adjacency (Manhattan distance 1 between consecutive steps)
+    dx = np.abs(np.diff(d2xy[:, 0]))
+    dy = np.abs(np.diff(d2xy[:, 1]))
+    dist = dx + dy
+    bad = np.count_nonzero(dist != 1)
+    if bad:
+        print(f"  WARNING: {bad} non-adjacent steps in Gilbert curve")
+
+    # build inverse table
+    xy2d = np.full((h, w), -1, dtype=np.int32)
+    xy2d[d2xy[:, 1], d2xy[:, 0]] = np.arange(n, dtype=np.int32)
+
+    np.save(d2xy_path, d2xy)
+    np.save(xy2d_path, xy2d)
+    print(f"  Saved to {d2xy_path} and {xy2d_path}")
+    return d2xy[:, 0], d2xy[:, 1], xy2d
+
+
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         raise urllib.error.HTTPError(req.full_url, code, msg, headers, fp)
@@ -343,12 +451,50 @@ def load_or_build_grid(data, grid_cache, avg_cache):
     return grid
 
 
+# ── Gilbert avg-grid ─────────────────────────────────────────────────
+def _scatter_avg_to_grid_gilbert(avg, d2xy_x, d2xy_y, w, h):
+    """Scatter per-image avg colours into a w×h×3 grid via Gilbert tables."""
+    grid = np.full((h, w, 3), 13, dtype='uint8')
+    n = len(d2xy_x)
+    grid[d2xy_y[:n], d2xy_x[:n]] = avg[:n]
+    return grid
+
+
+def load_or_build_grid_gilbert(data, grid_cache, avg_cache, d2xy_x, d2xy_y, w, h):
+    """Load the w×h×3 Gilbert avg-colour grid, building it if needed."""
+    if os.path.exists(grid_cache):
+        print("Loading cached Gilbert avg grid …")
+        return np.load(grid_cache)
+
+    if os.path.exists(avg_cache):
+        print("Building Gilbert avg grid from avg cache …")
+        avg = np.load(avg_cache)
+    else:
+        print("Computing average colours (one-time) …")
+        avg = np.empty((NUM_IMAGES, 3), dtype='uint8')
+        CHUNK = 200_000
+        t0 = time.time()
+        for i in range(0, NUM_IMAGES, CHUNK):
+            e = min(i + CHUNK, NUM_IMAGES)
+            avg[i:e] = data[i:e].mean(axis=(2, 3)).astype('uint8')
+            elapsed = time.time() - t0
+            pct = 100 * e / NUM_IMAGES
+            eta = elapsed / pct * (100 - pct) if pct > 0 else 0
+            print(f"\r  {pct:5.1f}%  ETA {eta:.0f}s", end='', flush=True)
+        print()
+        np.save(avg_cache, avg)
+
+    grid = _scatter_avg_to_grid_gilbert(avg, d2xy_x, d2xy_y, w, h)
+    np.save(grid_cache, grid)
+    print(f"Saved to {grid_cache}")
+    return grid
+
+
 # ── Viewer ────────────────────────────────────────────────────────────
 class Viewer:
-    @staticmethod
-    def _fit_zoom(w, h):
+    def _fit_zoom(self, w, h):
         """Zoom level that fits the whole grid in 90% of the shorter axis."""
-        ppi = 0.9 * min(w / SIDE, h / SIDE)
+        ppi = 0.9 * min(w / self._grid_w, h / self._grid_h)
         return math.log2(max(ppi, 2 ** (MIN_ZOOM + 5))) - 5
 
     def _acquire_lock(self):
@@ -376,10 +522,12 @@ class Viewer:
         except OSError:
             pass
 
-    def __init__(self, data_dir=None, verbose=False, quiet=False):
+    def __init__(self, data_dir=None, verbose=False, quiet=False, layout='hilbert'):
         self._verbose = verbose
         self._quiet = quiet
+        self._layout = layout
         self._init_paths(data_dir)
+        self._init_layout()
         self._init_view()
         self._init_search()
         self._init_window()        # GLFW + moderngl + shaders + avg texture
@@ -387,7 +535,7 @@ class Viewer:
         self._init_link_status()   # mmap, dict, thread pool, dot buffer
         self._init_shard_cache()   # fetch_dir, sqlite, tar shards, fi_* arrays
         self._init_crawl()         # crawl threads, status line state
-        self._log(f"Hilbert grid {SIDE}×{SIDE} (order {ORDER}) = {NUM_IMAGES:,} images")
+        self._log(f"{self._layout.title()} grid {self._grid_w}×{self._grid_h} = {NUM_IMAGES:,} images")
         self._log("Scroll=zoom  Drag=pan  Click=check  C=crawl  D=dim  R=reload  P=preview  F=full  M=meta  H=help  L=dots  /=search  Esc/Q=quit")
 
     def _log(self, msg):
@@ -405,10 +553,39 @@ class Viewer:
         self._link_cache = os.path.join(dd, 'link_status.bin')
         self._fetch_dir  = os.path.join(dd, 'fetched')
 
+    def _init_layout(self):
+        dd = os.path.dirname(self._filename)
+        if self._layout == 'gilbert':
+            d2xy_x, d2xy_y, xy2d = _build_gilbert_tables(GIL_W, GIL_H, dd)
+            self._grid_w, self._grid_h = GIL_W, GIL_H
+            self._gil_d2xy_x = d2xy_x
+            self._gil_d2xy_y = d2xy_y
+            self._gil_xy2d = xy2d
+            self._grid_cache = os.path.join(dd, f'gilbert_{GIL_W}x{GIL_H}_avg_grid.npy')
+        else:
+            self._grid_w, self._grid_h = SIDE, SIDE
+
+    def _d2xy(self, indices):
+        """Convert linear indices → (x_arr, y_arr) using the active layout."""
+        indices = np.asarray(indices, dtype=np.int64)
+        if self._layout == 'gilbert':
+            idx = np.clip(indices, 0, GIL_CELLS - 1)
+            return (self._gil_d2xy_x[idx].astype(np.int64),
+                    self._gil_d2xy_y[idx].astype(np.int64))
+        return hilbert_d2xy(ORDER, indices)
+
+    def _xy2d(self, x, y):
+        """Convert (x, y) → linear indices using the active layout."""
+        x = np.asarray(x, dtype=np.int64)
+        y = np.asarray(y, dtype=np.int64)
+        if self._layout == 'gilbert':
+            return self._gil_xy2d[y, x].astype(np.int64)
+        return hilbert_xy2d(ORDER, x, y)
+
     def _init_view(self):
         self.w, self.h = 1920, 1080
-        self.cx = SIDE / 2.0
-        self.cy = SIDE / 2.0
+        self.cx = self._grid_w / 2.0
+        self.cy = self._grid_h / 2.0
         self.zoom = self._fit_zoom(self.w, self.h)
         self.dragging = False
         self.mx = self.my = 0.0
@@ -467,9 +644,15 @@ class Viewer:
         self.data = np.memmap(self._filename, dtype='uint8', mode='r',
                               shape=(NUM_IMAGES, CH, IMG, IMG))
 
-        avg_grid = load_or_build_grid(self.data, self._grid_cache,
-                                      self._avg_cache)
-        self.avg_tex = self.ctx.texture((SIDE, SIDE), 3, avg_grid.tobytes())
+        if self._layout == 'gilbert':
+            avg_grid = load_or_build_grid_gilbert(
+                self.data, self._grid_cache, self._avg_cache,
+                self._gil_d2xy_x[:NUM_IMAGES], self._gil_d2xy_y[:NUM_IMAGES],
+                self._grid_w, self._grid_h)
+        else:
+            avg_grid = load_or_build_grid(self.data, self._grid_cache,
+                                          self._avg_cache)
+        self.avg_tex = self.ctx.texture((self._grid_w, self._grid_h), 3, avg_grid.tobytes())
         del avg_grid
         self.avg_tex.build_mipmaps()
         self.avg_tex.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
@@ -606,7 +789,7 @@ class Viewer:
         all_cached = [r[0] for r in self._fetch_db.execute('SELECT idx FROM images')]
         if all_cached:
             arr = np.array(all_cached, dtype=np.int64)
-            gx, gy = hilbert_d2xy(ORDER, arr)
+            gx, gy = self._d2xy(arr)
             self._fi_idx = arr
             self._fi_gx = gx.astype(np.int32)
             self._fi_gy = gy.astype(np.int32)
@@ -640,10 +823,10 @@ class Viewer:
         gx = self.cx + (sx - self.w / 2) / ppi
         gy = self.cy + (sy - self.h / 2) / ppi
         ix, iy = int(math.floor(gx)), int(math.floor(gy))
-        if ix < 0 or iy < 0 or ix >= SIDE or iy >= SIDE:
+        if ix < 0 or iy < 0 or ix >= self._grid_w or iy >= self._grid_h:
             return -1
-        idx = int(hilbert_xy2d(ORDER, ix, iy))
-        return idx if idx < NUM_IMAGES else -1
+        idx = int(self._xy2d(ix, iy))
+        return idx if 0 <= idx < NUM_IMAGES else -1
 
     def _keyword(self, idx):
         """Return the space-stripped keyword for image *idx*."""
@@ -748,7 +931,7 @@ class Viewer:
             "H          toggle this help",
             "L          toggle link-check dots",
             "D          dim all except fetched images",
-            "C          toggle Hilbert crawl from cursor",
+            "C          toggle curve crawl from cursor",
             "R          reload ok images from cache/network",
             "P          toggle hi-res preview popup",
             "/          search keywords",
@@ -826,7 +1009,7 @@ class Viewer:
 
     def _jump_to(self, idx):
         """Centre the view on image *idx*."""
-        gx, gy = hilbert_d2xy(ORDER, np.int64(idx))
+        gx, gy = self._d2xy(np.int64(idx))
         gx, gy = int(gx), int(gy)
         self.cx = gx + 0.5
         self.cy = gy + 0.5
@@ -881,7 +1064,7 @@ class Viewer:
             cached = self._load_fetched(idx)
             if cached is not None:
                 self._set_link_status(idx, 'ok')
-                gx, gy = hilbert_d2xy(ORDER, np.int64(idx))
+                gx, gy = self._d2xy(np.int64(idx))
                 with self._fetched_lock:
                     self._fetched_queue.append((idx, int(gx), int(gy), cached))
                 return
@@ -925,7 +1108,7 @@ class Viewer:
             if loud:
                 print(f"  check #{idx} image {w}x{h} → {pixels.shape}", flush=True)
             self._set_link_status(idx, 'ok')
-            gx, gy = hilbert_d2xy(ORDER, np.int64(idx))
+            gx, gy = self._d2xy(np.int64(idx))
             with self._fetched_lock:
                 self._fetched_queue.append((idx, int(gx), int(gy), pixels))
         except urllib.error.HTTPError as e:
@@ -1080,7 +1263,7 @@ class Viewer:
             self._check_link(idx)
             self._fetched_loading.discard(idx)
             return
-        gx, gy = hilbert_d2xy(ORDER, np.int64(idx))
+        gx, gy = self._d2xy(np.int64(idx))
         with self._fetched_lock:
             self._fetched_queue.append((idx, int(gx), int(gy), pixels))
 
@@ -1264,7 +1447,7 @@ class Viewer:
         elif key == glfw.KEY_Q:
             glfw.set_window_should_close(win, True)
         elif key == glfw.KEY_HOME:
-            self.cx, self.cy = SIDE / 2.0, SIDE / 2.0
+            self.cx, self.cy = self._grid_w / 2.0, self._grid_h / 2.0
             self.zoom = self._fit_zoom(self.w, self.h)
             self._dirty = True
         elif key == glfw.KEY_F:
@@ -1358,9 +1541,8 @@ class Viewer:
         cx0, cy0, cx1, cy1 = self._det_key
         return cx0 <= vp[0] and cy0 <= vp[1] and cx1 >= vp[2] and cy1 >= vp[3]
 
-    @staticmethod
-    def _build_region(data, gx0, gy0, gx1, gy1, cancel=None):
-        """Assemble a pixel buffer for a grid region (Hilbert layout)."""
+    def _build_region(self, data, gx0, gy0, gx1, gy1, cancel=None):
+        """Assemble a pixel buffer for a grid region."""
         vw, vh = gx1 - gx0, gy1 - gy0
         buf = np.full((vh * IMG, vw * IMG, CH), 13, dtype='uint8')
 
@@ -1371,8 +1553,8 @@ class Viewer:
         gxs = gxs.ravel()
         gys = gys.ravel()
 
-        # Hilbert index for each cell
-        file_idx = hilbert_xy2d(ORDER, gxs, gys)
+        # curve index for each cell
+        file_idx = self._xy2d(gxs, gys)
 
         # filter valid
         valid = file_idx < NUM_IMAGES
@@ -1429,11 +1611,13 @@ class Viewer:
         data = self.data
         self._det_build_vp = (cx, cy, ppi, w, h)
         vp1 = self._viewport_rect(margin=1)
+        grid_w, grid_h = self._grid_w, self._grid_h
+        build_region = self._build_region
 
         def clamp_region(gx0, gy0, gx1, gy1):
             max_imgs = MAX_TEX // IMG
             gx0 = max(0, gx0); gy0 = max(0, gy0)
-            gx1 = min(SIDE, gx1); gy1 = min(SIDE, gy1)
+            gx1 = min(grid_w, gx1); gy1 = min(grid_h, gy1)
             vw, vh = gx1 - gx0, gy1 - gy0
             if vw > max_imgs:
                 ex = vw - max_imgs
@@ -1447,7 +1631,7 @@ class Viewer:
             # Phase 1: viewport only (small, fast)
             vgx0, vgy0, vgx1, vgy1 = clamp_region(*vp1)
             if vgx1 > vgx0 and vgy1 > vgy0:
-                buf, vw, vh = Viewer._build_region(
+                buf, vw, vh = build_region(
                     data, vgx0, vgy0, vgx1, vgy1, cancel=cancel)
                 if cancel.is_set():
                     return
@@ -1467,7 +1651,7 @@ class Viewer:
                 int(cx - mw), int(cy - mh),
                 int(cx + mw) + 1, int(cy + mh) + 1)
             if mgx1 > mgx0 and mgy1 > mgy0:
-                buf, vw, vh = Viewer._build_region(
+                buf, vw, vh = build_region(
                     data, mgx0, mgy0, mgx1, mgy1, cancel=cancel)
                 if cancel.is_set():
                     return
@@ -1562,12 +1746,12 @@ class Viewer:
                     submitted = True
         # also retry ok images not in cache (e.g. checked before fetch existed)
         ok_code = STATUS_CODES['ok']
-        vgx = np.arange(max(0, gx0), min(SIDE, gx1), dtype=np.int64)
-        vgy = np.arange(max(0, gy0), min(SIDE, gy1), dtype=np.int64)
+        vgx = np.arange(max(0, gx0), min(self._grid_w, gx1), dtype=np.int64)
+        vgy = np.arange(max(0, gy0), min(self._grid_h, gy1), dtype=np.int64)
         if len(vgx) > 0 and len(vgy) > 0:
             mgx, mgy = np.meshgrid(vgx, vgy)
-            vidx = hilbert_xy2d(ORDER, mgx.ravel(), mgy.ravel())
-            vidx = vidx[vidx < NUM_IMAGES]
+            vidx = self._xy2d(mgx.ravel(), mgy.ravel())
+            vidx = vidx[(vidx >= 0) & (vidx < NUM_IMAGES)]
             for i in vidx[self._link_status[vidx] == ok_code]:
                 idx = int(i)
                 if (idx not in self._fi_set
@@ -1614,7 +1798,7 @@ class Viewer:
             n = len(checked)
             if n == 0:
                 return
-            gx, gy = hilbert_d2xy(ORDER, checked)
+            gx, gy = self._d2xy(checked)
             codes = snapshot[checked]
             colors = STATUS_COLORS_LUT[codes]
             vdata = np.empty((n, 5), dtype='f4')
@@ -1656,7 +1840,7 @@ class Viewer:
         # New dots: compute positions, append to buffer
         if new_dots:
             new_arr = np.array(new_dots, dtype=np.int64)
-            ngx, ngy = hilbert_d2xy(ORDER, new_arr)
+            ngx, ngy = self._d2xy(new_arr)
             codes = self._link_status[new_arr]
             colors = STATUS_COLORS_LUT[codes]
             n_new = len(new_dots)
@@ -1708,7 +1892,7 @@ class Viewer:
         self.prog['u_center'].value = (self.cx, self.cy)
         self.prog['u_ppi'].value    = self.ppi
         self.prog['u_screen'].value = (float(self.w), float(self.h))
-        self.prog['u_grid'].value   = (float(SIDE), float(SIDE))
+        self.prog['u_grid'].value   = (float(self._grid_w), float(self._grid_h))
         self.prog['u_dim'].value    = 0.85 if self._dim_mode else 0.0
 
         self.vao.render(moderngl.TRIANGLE_STRIP)
@@ -1964,6 +2148,9 @@ if __name__ == '__main__':
                         help='Show per-image crawl/fetch output')
     parser.add_argument('-q', '--quiet', action='store_true',
                         help='Suppress all output except fatal errors')
+    parser.add_argument('--layout', choices=['hilbert', 'gilbert'],
+                        default='hilbert',
+                        help='Space-filling curve layout (default: hilbert)')
     args = parser.parse_args()
     Viewer(data_dir=args.data_dir, verbose=args.verbose,
-           quiet=args.quiet).run()
+           quiet=args.quiet, layout=args.layout).run()
