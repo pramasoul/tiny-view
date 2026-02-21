@@ -1556,8 +1556,8 @@ class Viewer:
         # curve index for each cell
         file_idx = self._xy2d(gxs, gys)
 
-        # filter valid
-        valid = file_idx < NUM_IMAGES
+        # filter valid (Gilbert holes have xy2d == -1)
+        valid = (file_idx >= 0) & (file_idx < NUM_IMAGES)
         file_idx = file_idx[valid]
         gxs = gxs[valid]
         gys = gys[valid]
