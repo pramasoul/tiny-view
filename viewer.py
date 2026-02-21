@@ -378,17 +378,33 @@ class Viewer:
     def __init__(self, data_dir=None, verbose=False, quiet=False):
         self._verbose = verbose
         self._quiet = quiet
+        self._init_paths(data_dir)
+        self._init_view()
+        self._init_search()
+        self._init_window()        # GLFW + moderngl + shaders + avg texture
+        self._init_overlays()      # metadata/help overlay shader + state
+        self._init_link_status()   # mmap, dict, thread pool, dot buffer
+        self._init_shard_cache()   # fetch_dir, sqlite, tar shards, fi_* arrays
+        self._init_crawl()         # crawl threads, status line state
+        self._log(f"Hilbert grid {SIDE}×{SIDE} (order {ORDER}) = {NUM_IMAGES:,} images")
+        self._log("Scroll=zoom  Drag=pan  Click=check  C=crawl  D=dim  R=reload  F=full  M=meta  H=help  L=dots  /=search  Esc/Q=quit")
 
-        # resolve data paths
+    def _log(self, msg):
+        if not self._quiet:
+            print(msg, flush=True)
+
+    # ── init helpers ─────────────────────────────────────────────────
+
+    def _init_paths(self, data_dir):
         dd = data_dir or DATA_DIR
-        self._filename  = os.path.join(dd, 'tiny_images.bin')
-        self._metafile  = os.path.join(dd, 'tiny_metadata.bin')
-        self._avg_cache = os.path.join(dd, 'avg_colors.npy')
+        self._filename   = os.path.join(dd, 'tiny_images.bin')
+        self._metafile   = os.path.join(dd, 'tiny_metadata.bin')
+        self._avg_cache  = os.path.join(dd, 'avg_colors.npy')
         self._grid_cache = os.path.join(dd, 'hilbert_avg_grid.npy')
         self._link_cache = os.path.join(dd, 'link_status.bin')
-        self._fetch_dir = os.path.join(dd, 'fetched')
+        self._fetch_dir  = os.path.join(dd, 'fetched')
 
-        # view state
+    def _init_view(self):
         self.w, self.h = 1920, 1080
         self.cx = SIDE / 2.0
         self.cy = SIDE / 2.0
@@ -399,24 +415,24 @@ class Viewer:
         # detail texture cache
         self._det_key = None
         self._det_tex = None
-        self._dirty = True        # need re-render
+        self._dirty = True
 
         # background detail builder
         self._bg_thread = None
         self._bg_cancel = threading.Event()
         self._bg_lock = threading.Lock()
-        self._bg_results = []    # [(key, buf, vw, vh), ...] from bg thread
-        self._det_build_vp = None  # viewport state last build was started for
-
-        # keyword search (None = inactive, str = active query)
-        self._search = None
+        self._bg_results = []
+        self._det_build_vp = None
 
         # fullscreen state
         self._fullscreen = False
         self._windowed_pos = (100, 100)
         self._windowed_size = (self.w, self.h)
 
-        # ── GLFW ──
+    def _init_search(self):
+        self._search = None
+
+    def _init_window(self):
         if not glfw.init():
             sys.exit("glfw.init() failed")
         glfw.window_hint(glfw.CONTEXT_VERSION_MAJOR, 3)
@@ -438,7 +454,6 @@ class Viewer:
         glfw.set_key_callback(self.win, self._on_key)
         glfw.set_char_callback(self.win, self._on_char)
 
-        # ── moderngl ──
         self.ctx = moderngl.create_context()
 
         quad = np.array([-1, -1, 1, -1, -1, 1, 1, 1], dtype='f4')
@@ -447,9 +462,7 @@ class Viewer:
             self.prog, [(self.ctx.buffer(quad), '2f', 'pos')]
         )
 
-        # ── data ──
-        if not self._quiet:
-            print(f"Memory-mapping {self._filename} …")
+        self._log(f"Memory-mapping {self._filename} …")
         self.data = np.memmap(self._filename, dtype='uint8', mode='r',
                               shape=(NUM_IMAGES, CH, IMG, IMG))
 
@@ -463,18 +476,20 @@ class Viewer:
         # 1×1 dummy for the detail slot when unused
         self._dummy = self.ctx.texture((1, 1), 3, b'\x00\x00\x00')
 
-        # ── metadata ──
         self.meta = np.memmap(self._metafile, dtype='uint8', mode='r',
                               shape=(NUM_IMAGES, META_REC))
-        self._hover_idx = -1      # image index under cursor
+        self._hover_idx = -1
 
-        # ── metadata / help overlay ──
+    def _init_overlays(self):
         self._show_meta = False
         self._show_help = False
         self._meta_tex = None
-        self._meta_idx = -1       # avoid redundant re-renders for same image
-        self._meta_tw = 0         # texture width  (pixels)
-        self._meta_th = 0         # texture height (pixels)
+        self._meta_idx = -1
+        self._meta_tw = 0
+        self._meta_th = 0
+        self._help_tex = None
+        self._help_tw = 0
+        self._help_th = 0
 
         self._overlay_prog = self.ctx.program(
             vertex_shader=OVERLAY_VERT, fragment_shader=OVERLAY_FRAG)
@@ -483,7 +498,7 @@ class Viewer:
             self._overlay_prog,
             [(self.ctx.buffer(overlay_quad), '2f', 'pos')])
 
-        # ── link checking ──
+    def _init_link_status(self):
         self._link_lock = threading.Lock()
         self._link_pool = concurrent.futures.ThreadPoolExecutor(max_workers=64)
         self._link_dirty = False
@@ -499,31 +514,45 @@ class Viewer:
         self._link_status = np.memmap(self._link_cache, dtype='uint8', mode='r+',
                                       shape=(NUM_IMAGES,))
         self._link_checks = {}
-        snapshot = np.array(self._link_status)   # copy — nonzero on mmap can race
+        snapshot = np.array(self._link_status)
         checked = np.nonzero(snapshot)[0]
         del snapshot
         for i in checked:
             self._link_checks[int(i)] = STATUS_NAMES.get(
                 int(self._link_status[i]), 'error')
-        if checked.size and not self._quiet:
-            print(f"Restored {checked.size:,} link checks from cache",
-                  flush=True)
+        if checked.size:
+            self._log(f"Restored {checked.size:,} link checks from cache")
 
-        # Hilbert crawl state
-        self._crawl_cancel = threading.Event()
-        self._crawl_threads = []
-        self._crawl_origin = -1
-        self._crawl_count = [0, 0]    # [forward, backward]
-
-        # dim mode — darken everything except fetched overlays
         self._dim_mode = False
 
-        # instance lock (protects tar shards from concurrent writes)
+        # dot shader + cached dot buffer
+        self._dot_prog = self.ctx.program(
+            vertex_shader=DOT_VERT, fragment_shader=DOT_FRAG)
+        self._dot_pos = {}
+        self._dot_checked = np.empty(0, dtype=np.int64)
+        self._dot_gx = np.empty(0, dtype='f4')
+        self._dot_gy = np.empty(0, dtype='f4')
+        self._dot_buf = None
+        self._dot_vao = None
+        self._dot_n = 0
+        self._dot_cap = 0
+        self._dot_last_rebuild = 0.0
+        self._tex_mgr_last = 0.0
+        self._viewport_changed = True
+        self._dot_needs_rebuild = False
+        self._dot_journal = set()
+        self._dot_journal_lock = threading.Lock()
+        self._ok_cells_buf = None
+        self._ok_cells_vao = None
+        self._ok_cells_n = 0
+        self._ok_cells_dirty = True
+        self._rebuild_dots()
+
+    def _init_shard_cache(self):
         self._lock_path = os.path.join(self._fetch_dir, 'viewer.pid')
         os.makedirs(self._fetch_dir, exist_ok=True)
         self._acquire_lock()
 
-        # fetched image cache (tar shards + SQLite index)
         self._fetch_db = sqlite3.connect(
             os.path.join(self._fetch_dir, 'index.db'), check_same_thread=False)
         self._fetch_db.execute('PRAGMA journal_mode=WAL')
@@ -534,24 +563,22 @@ class Viewer:
             height INTEGER NOT NULL,
             offset INTEGER,
             size INTEGER)''')
-        # add offset/size columns if upgrading from old schema
         try:
             self._fetch_db.execute('ALTER TABLE images ADD COLUMN offset INTEGER')
         except sqlite3.OperationalError:
-            pass  # column already exists
+            pass
         try:
             self._fetch_db.execute('ALTER TABLE images ADD COLUMN size INTEGER')
         except sqlite3.OperationalError:
-            pass  # column already exists
+            pass
         self._fetch_db.commit()
-        # migrate: populate offset/size for old rows that lack them
         need_migrate = self._fetch_db.execute(
             'SELECT COUNT(*) FROM images WHERE offset IS NULL').fetchone()[0]
         if need_migrate:
             self._migrate_offsets()
         self._shard_lock = threading.Lock()
         self._shard_dirty = 0
-        self._shard_tf = None   # persistent tarfile handle
+        self._shard_tf = None
         shard_files = sorted(
             f for f in os.listdir(self._fetch_dir)
             if f.startswith('shard_') and f.endswith('.tar'))
@@ -562,16 +589,14 @@ class Viewer:
         else:
             self._shard_num = 0
         cached = self._fetch_db.execute('SELECT COUNT(*) FROM images').fetchone()[0]
-        if cached and not self._quiet:
-            print(f"Fetched image cache: {cached} images in {len(shard_files)} shard(s)",
-                  flush=True)
+        if cached:
+            self._log(f"Fetched image cache: {cached} images in {len(shard_files)} shard(s)")
 
         # fetched image overlay (viewport-scoped GPU textures)
-        self._fetched_queue = []      # [(idx, gx, gy, pixels), ...] from workers
+        self._fetched_queue = []
         self._fetched_lock = threading.Lock()
-        self._fetched_textures = {}   # idx → (texture, gx, gy) — only visible
-        self._fetched_loading = set() # idx currently being loaded from cache
-        # index of all cached images (numpy arrays + set for O(1) lookup)
+        self._fetched_textures = {}
+        self._fetched_loading = set()
         all_cached = [r[0] for r in self._fetch_db.execute('SELECT idx FROM images')]
         if all_cached:
             arr = np.array(all_cached, dtype=np.int64)
@@ -586,44 +611,23 @@ class Viewer:
             self._fi_gy = np.empty(0, dtype=np.int32)
             self._fi_set = set()
 
-        # dot shader + cached dot buffer
-        self._dot_prog = self.ctx.program(
-            vertex_shader=DOT_VERT, fragment_shader=DOT_FRAG)
-        self._dot_pos = {}              # idx → slot in GPU buffer
-        self._dot_checked = np.empty(0, dtype=np.int64)  # for ok-cells
-        self._dot_gx = np.empty(0, dtype='f4')
-        self._dot_gy = np.empty(0, dtype='f4')
-        self._dot_buf = None
-        self._dot_vao = None
-        self._dot_n = 0
-        self._dot_cap = 0
-        self._dot_last_rebuild = 0.0
-        self._tex_mgr_last = 0.0
-        self._viewport_changed = True
-        self._dot_needs_rebuild = False
-        self._dot_journal = set()       # indices changed since last rebuild
-        self._dot_journal_lock = threading.Lock()
-        self._ok_cells_buf = None       # cached GPU buffer for dim-mode ok dots
-        self._ok_cells_vao = None
-        self._ok_cells_n = 0
-        self._ok_cells_dirty = True     # rebuild when ok set changes
-        self._rebuild_dots()
-
-        # status line state
+    def _init_crawl(self):
+        self._crawl_cancel = threading.Event()
+        self._crawl_threads = []
+        self._crawl_origin = -1
+        self._crawl_count = [0, 0]
         self._status_last = 0.0
         self._status_shown = False
 
-        if not self._quiet:
-            print(f"Hilbert grid {SIDE}×{SIDE} (order {ORDER}) = {NUM_IMAGES:,} images", flush=True)
-            print("Scroll=zoom  Drag=pan  Click=check  C=crawl  D=dim  R=reload  F=full  M=meta  H=help  L=dots  /=search  Esc/Q=quit", flush=True)
+    # ── properties ───────────────────────────────────────────────────
 
-    # ── properties ────────────────────────────────────────────────────
     @property
     def ppi(self):
         """Display pixels per image at current zoom."""
         return 2.0 ** (self.zoom + 5)
 
-    # ── helpers ────────────────────────────────────────────────────────
+    # ── helpers ──────────────────────────────────────────────────────
+
     def _screen_to_image_idx(self, sx, sy):
         """Return the linear image index under screen coords (sx, sy), or -1."""
         ppi = self.ppi
@@ -663,6 +667,7 @@ class Viewer:
         glfw.set_window_title(self.win, "  |  ".join(parts) if parts else "Tiny Images")
 
     # ── metadata overlay ─────────────────────────────────────────────
+
     def _read_meta(self, idx):
         """Parse full metadata record for image *idx* into a dict."""
         raw = bytes(self.meta[idx])
@@ -684,6 +689,13 @@ class Viewer:
             ruler = "url:      " + "W" * 80
             self._meta_fw = font.getbbox(ruler)[2] + pad * 2
         return self._meta_fw
+
+    def _make_overlay_tex(self, img):
+        """Convert a PIL RGBA image to a GL texture. Returns (tex, tw, th)."""
+        tw, th = img.size
+        tex = self.ctx.texture((tw, th), 4, img.tobytes())
+        tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
+        return tex, tw, th
 
     def _render_meta_texture(self, idx):
         """Render metadata for image *idx* into an RGBA texture."""
@@ -712,18 +724,14 @@ class Viewer:
             draw.text((pad, y), ln, fill=(255, 255, 255, 255), font=font)
             y += line_h
 
-        buf = img.tobytes()
         if self._meta_tex is not None:
             self._meta_tex.release()
-        self._meta_tex = self.ctx.texture((tw, th), 4, buf)
-        self._meta_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
-        self._meta_tw = tw
-        self._meta_th = th
+        self._meta_tex, self._meta_tw, self._meta_th = self._make_overlay_tex(img)
         self._meta_idx = idx
 
     def _render_help_texture(self):
         """Render help overlay into an RGBA texture (cached)."""
-        if hasattr(self, '_help_tex') and self._help_tex is not None:
+        if self._help_tex is not None:
             return
         lines = [
             "Scroll     zoom (toward cursor)",
@@ -791,13 +799,10 @@ class Viewer:
                       fill=(255, 255, 255, 255), font=font)
             y += line_h
 
-        buf = img.tobytes()
-        self._help_tex = self.ctx.texture((tw, th), 4, buf)
-        self._help_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
-        self._help_tw = tw
-        self._help_th = th
+        self._help_tex, self._help_tw, self._help_th = self._make_overlay_tex(img)
 
-    # ── keyword search ────────────────────────────────────────────────
+    # ── keyword search ───────────────────────────────────────────────
+
     def _find_prefix(self, prefix):
         """Binary search for first image whose keyword >= prefix."""
         pb = prefix.encode('ascii')
@@ -842,6 +847,7 @@ class Viewer:
         glfw.set_window_title(self.win, "  |  ".join(parts))
 
     # ── link checking ────────────────────────────────────────────────
+
     def _enqueue_link_check(self, idx, verbose=False):
         """Queue a GET check+fetch for the source URL of image *idx*."""
         with self._link_lock:
@@ -863,22 +869,22 @@ class Viewer:
     def _check_link(self, idx, verbose=False):
         """GET the source URL, classify it, and fetch the image (runs in thread pool)."""
         loud = (self._verbose or verbose) and not self._quiet
-        # already fetched — just mark ok and queue for display
-        cached = self._load_fetched(idx)
-        if cached is not None:
-            self._set_link_status(idx, 'ok')
-            gx, gy = hilbert_d2xy(ORDER, np.int64(idx))
-            with self._fetched_lock:
-                self._fetched_queue.append((idx, int(gx), int(gy), cached))
-            return
-        meta = self._read_meta(idx)
-        url = meta['source_url'].strip('\x00 ')
-        if not url:
-            self._set_link_status(idx, 'no_url')
-            return
-        if not url.startswith(('http://', 'https://')):
-            url = 'http://' + url
         try:
+            # already fetched — just mark ok and queue for display
+            cached = self._load_fetched(idx)
+            if cached is not None:
+                self._set_link_status(idx, 'ok')
+                gx, gy = hilbert_d2xy(ORDER, np.int64(idx))
+                with self._fetched_lock:
+                    self._fetched_queue.append((idx, int(gx), int(gy), cached))
+                return
+            meta = self._read_meta(idx)
+            url = meta['source_url'].strip('\x00 ')
+            if not url:
+                self._set_link_status(idx, 'no_url')
+                return
+            if not url.startswith(('http://', 'https://')):
+                url = 'http://' + url
             if loud:
                 print(f"  check #{idx} GET {url[:80]}", flush=True)
             req = urllib.request.Request(
@@ -929,6 +935,8 @@ class Viewer:
                 print(f"  check #{idx} FAILED: {e}", flush=True)
             self._set_link_status(idx, 'error')
 
+    # ── shard cache ──────────────────────────────────────────────────
+
     def _migrate_offsets(self):
         """One-time migration: scan tar shards to populate offset/size."""
         rows = self._fetch_db.execute(
@@ -950,8 +958,8 @@ class Viewer:
                         (member.offset_data, member.size, idx))
                     total += 1
         self._fetch_db.commit()
-        if total and not self._quiet:
-            print(f"Migrated {total} cache entries with byte offsets", flush=True)
+        if total:
+            self._log(f"Migrated {total} cache entries with byte offsets")
 
     def _open_shard(self):
         """Open (or reopen) the current shard tar for appending.
@@ -992,9 +1000,8 @@ class Viewer:
                     break  # data truncated
                 f.seek(data_blocks * 512, 1)
                 safe = entry_end
-        if not self._quiet:
-            print(f"Repairing {path}: truncating to {safe} and re-terminating "
-                  f"({file_size - safe} bytes removed)", flush=True)
+        self._log(f"Repairing {path}: truncating to {safe} and re-terminating "
+                  f"({file_size - safe} bytes removed)")
         with open(path, 'r+b') as f:
             f.seek(safe)
             f.write(b'\x00' * 1024)  # two 512-byte end-of-archive blocks
@@ -1085,6 +1092,7 @@ class Viewer:
             self._link_pool.submit(self._reload_one, idx)
 
     # ── Hilbert crawl ────────────────────────────────────────────────
+
     def _crawl_worker(self, start_idx, direction):
         """Walk the Hilbert curve from start_idx, direction = +1 or -1."""
         slot = 0 if direction > 0 else 1
@@ -1158,7 +1166,8 @@ class Viewer:
         print(f"\r{line}\033[K", end='', flush=True)
         self._status_shown = True
 
-    # ── input callbacks ───────────────────────────────────────────────
+    # ── input callbacks ──────────────────────────────────────────────
+
     def _on_scroll(self, win, _dx, dy):
         mx, my = glfw.get_cursor_pos(win)
         old_ppi = self.ppi
@@ -1282,6 +1291,7 @@ class Viewer:
             self._dirty = True
 
     # ── fullscreen ───────────────────────────────────────────────────
+
     def _toggle_fullscreen(self):
         if self._fullscreen:
             self._leave_fullscreen()
@@ -1306,12 +1316,15 @@ class Viewer:
         self._fullscreen = False
         self._dirty = True
 
-    # ── detail texture ────────────────────────────────────────────────
-    def _viewport_rect(self):
-        """Return (gx0, gy0, gx1, gy1) of the current viewport in grid coords."""
+    # ── detail texture ───────────────────────────────────────────────
+
+    def _viewport_rect(self, margin=0):
+        """(gx0, gy0, gx1, gy1) of visible grid cells, optionally expanded by margin."""
         ppi = self.ppi
-        hw = self.w / (2 * ppi)
-        hh = self.h / (2 * ppi)
+        hw, hh = self.w / (2 * ppi), self.h / (2 * ppi)
+        if margin:
+            return (int(self.cx - hw) - margin, int(self.cy - hh) - margin,
+                    int(self.cx + hw) + margin + 1, int(self.cy + hh) + 1 + margin)
         return (self.cx - hw, self.cy - hh, self.cx + hw, self.cy + hh)
 
     def _detail_feasible(self):
@@ -1320,9 +1333,8 @@ class Viewer:
             return False
         # Don't build if viewport exceeds max texture size (would just clamp)
         max_imgs = MAX_TEX // IMG
-        hw = self.w / (2 * self.ppi)
-        hh = self.h / (2 * self.ppi)
-        return (2 * hw + 3) <= max_imgs and (2 * hh + 3) <= max_imgs
+        gx0, gy0, gx1, gy1 = self._viewport_rect()
+        return (gx1 - gx0 + 3) <= max_imgs and (gy1 - gy0 + 3) <= max_imgs
 
     def _detail_covers_viewport(self):
         """Does the cached detail texture fully cover the current viewport?"""
@@ -1402,6 +1414,7 @@ class Viewer:
         w, h = self.w, self.h
         data = self.data
         self._det_build_vp = (cx, cy, ppi, w, h)
+        vp1 = self._viewport_rect(margin=1)
 
         def clamp_region(gx0, gy0, gx1, gy1):
             max_imgs = MAX_TEX // IMG
@@ -1417,13 +1430,8 @@ class Viewer:
             return gx0, gy0, gx1, gy1
 
         def worker():
-            hw = w / (2 * ppi)
-            hh = h / (2 * ppi)
-
             # Phase 1: viewport only (small, fast)
-            vgx0, vgy0, vgx1, vgy1 = clamp_region(
-                int(cx - hw) - 1, int(cy - hh) - 1,
-                int(cx + hw) + 2, int(cy + hh) + 2)
+            vgx0, vgy0, vgx1, vgy1 = clamp_region(*vp1)
             if vgx1 > vgx0 and vgy1 > vgy0:
                 buf, vw, vh = Viewer._build_region(
                     data, vgx0, vgy0, vgx1, vgy1, cancel=cancel)
@@ -1437,6 +1445,8 @@ class Viewer:
                 return
 
             # Phase 2: full margin region
+            hw = w / (2 * ppi)
+            hh = h / (2 * ppi)
             mw = hw * DETAIL_MARGIN
             mh = hh * DETAIL_MARGIN
             mgx0, mgy0, mgx1, mgy1 = clamp_region(
@@ -1473,12 +1483,7 @@ class Viewer:
         self._det_key = key
         return True
 
-    def _visible_rect(self, margin=2):
-        """Return (gx0, gy0, gx1, gy1) of visible grid cells with margin."""
-        ppi = self.ppi
-        hw, hh = self.w / (2 * ppi), self.h / (2 * ppi)
-        return (int(self.cx - hw) - margin, int(self.cy - hh) - margin,
-                int(self.cx + hw) + margin + 1, int(self.cy + hh) + margin + 1)
+    # ── fetched textures ─────────────────────────────────────────────
 
     def _upload_pending_fetches(self):
         """Upload queued fetched images to GPU textures."""
@@ -1510,6 +1515,57 @@ class Viewer:
             self._fi_gy = np.concatenate([self._fi_gy,
                                           np.array(new_gy, dtype=np.int32)])
         return True
+
+    def _manage_fetched_textures(self):
+        """Evict off-screen textures, load visible cached images."""
+        if self.ppi < FETCH_MIN_PPI:
+            if self._fetched_textures:
+                for tex, _gx, _gy in self._fetched_textures.values():
+                    tex.release()
+                self._fetched_textures.clear()
+                self._dirty = True
+            self._fetched_loading.clear()
+            return
+        gx0, gy0, gx1, gy1 = self._viewport_rect(margin=2)
+        # evict off-screen (wider margin to avoid load/evict churn)
+        ex0, ey0, ex1, ey1 = self._viewport_rect(margin=16)
+        for idx in list(self._fetched_textures):
+            _, gx, gy = self._fetched_textures[idx]
+            if not (ex0 <= gx <= ex1 and ey0 <= gy <= ey1):
+                self._fetched_textures[idx][0].release()
+                del self._fetched_textures[idx]
+        # load visible cached images that lack textures (vectorized scan)
+        submitted = False
+        if len(self._fi_idx) > 0:
+            vis = ((self._fi_gx >= gx0) & (self._fi_gx <= gx1) &
+                   (self._fi_gy >= gy0) & (self._fi_gy <= gy1))
+            for idx_i in self._fi_idx[vis]:
+                idx = int(idx_i)
+                if (idx not in self._fetched_textures
+                        and idx not in self._fetched_loading):
+                    self._fetched_loading.add(idx)
+                    self._link_pool.submit(self._reload_one, idx)
+                    submitted = True
+        # also retry ok images not in cache (e.g. checked before fetch existed)
+        ok_code = STATUS_CODES['ok']
+        vgx = np.arange(max(0, gx0), min(SIDE, gx1), dtype=np.int64)
+        vgy = np.arange(max(0, gy0), min(SIDE, gy1), dtype=np.int64)
+        if len(vgx) > 0 and len(vgy) > 0:
+            mgx, mgy = np.meshgrid(vgx, vgy)
+            vidx = hilbert_xy2d(ORDER, mgx.ravel(), mgy.ravel())
+            vidx = vidx[vidx < NUM_IMAGES]
+            for i in vidx[self._link_status[vidx] == ok_code]:
+                idx = int(i)
+                if (idx not in self._fi_set
+                        and idx not in self._fetched_textures
+                        and idx not in self._fetched_loading):
+                    self._fetched_loading.add(idx)
+                    self._link_pool.submit(self._reload_one, idx)
+                    submitted = True
+        if submitted:
+            self._dirty = True
+
+    # ── dot buffer ───────────────────────────────────────────────────
 
     _DOT_STRIDE = 20  # 5 floats × 4 bytes: gx, gy, r, g, b
 
@@ -1605,62 +1661,19 @@ class Viewer:
             self._dot_gy = np.concatenate([self._dot_gy, ngy.astype('f4')])
             self._dot_n += n_new
 
-    def _manage_fetched_textures(self):
-        """Evict off-screen textures, load visible cached images."""
-        if self.ppi < FETCH_MIN_PPI:
-            if self._fetched_textures:
-                for tex, _gx, _gy in self._fetched_textures.values():
-                    tex.release()
-                self._fetched_textures.clear()
-                self._dirty = True
-            self._fetched_loading.clear()
-            return
-        gx0, gy0, gx1, gy1 = self._visible_rect()
-        # evict off-screen (wider margin to avoid load/evict churn)
-        ex0, ey0, ex1, ey1 = self._visible_rect(margin=16)
-        for idx in list(self._fetched_textures):
-            _, gx, gy = self._fetched_textures[idx]
-            if not (ex0 <= gx <= ex1 and ey0 <= gy <= ey1):
-                self._fetched_textures[idx][0].release()
-                del self._fetched_textures[idx]
-        # load visible cached images that lack textures (vectorized scan)
-        submitted = False
-        if len(self._fi_idx) > 0:
-            vis = ((self._fi_gx >= gx0) & (self._fi_gx <= gx1) &
-                   (self._fi_gy >= gy0) & (self._fi_gy <= gy1))
-            for idx_i in self._fi_idx[vis]:
-                idx = int(idx_i)
-                if (idx not in self._fetched_textures
-                        and idx not in self._fetched_loading):
-                    self._fetched_loading.add(idx)
-                    self._link_pool.submit(self._reload_one, idx)
-                    submitted = True
-        # also retry ok images not in cache (e.g. checked before fetch existed)
-        ok_code = STATUS_CODES['ok']
-        vgx = np.arange(max(0, gx0), min(SIDE, gx1), dtype=np.int64)
-        vgy = np.arange(max(0, gy0), min(SIDE, gy1), dtype=np.int64)
-        if len(vgx) > 0 and len(vgy) > 0:
-            mgx, mgy = np.meshgrid(vgx, vgy)
-            vidx = hilbert_xy2d(ORDER, mgx.ravel(), mgy.ravel())
-            vidx = vidx[vidx < NUM_IMAGES]
-            for i in vidx[self._link_status[vidx] == ok_code]:
-                idx = int(i)
-                if (idx not in self._fi_set
-                        and idx not in self._fetched_textures
-                        and idx not in self._fetched_loading):
-                    self._fetched_loading.add(idx)
-                    self._link_pool.submit(self._reload_one, idx)
-                    submitted = True
-        if submitted:
-            self._dirty = True
+    # ── render ───────────────────────────────────────────────────────
 
-    # ── render ────────────────────────────────────────────────────────
     def _render(self):
         """Render immediately with whatever detail texture is cached."""
         self.ctx.clear(0.05, 0.05, 0.05)
+        self._render_base_map()
+        self._render_ok_cells()
+        self._render_fetched()
+        self._render_dots()
+        self._render_info_overlay()
 
-        # use cached detail (may be stale / partially offscreen — that's fine,
-        # the shader falls through to avg colours for uncovered areas)
+    def _render_base_map(self):
+        """Draw the avg-colour grid with optional detail texture overlay."""
         det_ok = self._det_tex is not None and self._det_key is not None
         self.avg_tex.use(0)
         if det_ok:
@@ -1685,77 +1698,84 @@ class Viewer:
 
         self.vao.render(moderngl.TRIANGLE_STRIP)
 
-        # ── undimmed ok cells (when dimmed + zoomed out past hi-res) ──
-        if self._dim_mode and self.ppi < FETCH_MIN_PPI and self._dot_n > 0:
-            if self._ok_cells_dirty:
-                self._ok_cells_dirty = False
-                ok_mask = self._link_status[self._dot_checked] == STATUS_CODES['ok']
-                ok_count = ok_mask.sum()
-                if self._ok_cells_buf is not None:
-                    self._ok_cells_vao.release()
-                    self._ok_cells_buf.release()
-                    self._ok_cells_buf = None
-                    self._ok_cells_vao = None
-                    self._ok_cells_n = 0
-                if ok_count > 0:
-                    ok_gx = self._dot_gx[ok_mask]
-                    ok_gy = self._dot_gy[ok_mask]
-                    ok_arr = self._dot_checked[ok_mask]
-                    raw_avg = self.data[ok_arr].reshape(ok_count, CH, -1).mean(axis=2)
-                    vdata = np.empty((ok_count, 5), dtype='f4')
-                    vdata[:, 0] = ok_gx
-                    vdata[:, 1] = ok_gy
-                    vdata[:, 2] = raw_avg[:, 2] / 255.0  # R (was B)
-                    vdata[:, 3] = raw_avg[:, 1] / 255.0  # G
-                    vdata[:, 4] = raw_avg[:, 0] / 255.0  # B (was R)
-                    self._ok_cells_buf = self.ctx.buffer(vdata.tobytes())
-                    self._ok_cells_vao = self.ctx.vertex_array(
-                        self._dot_prog,
-                        [(self._ok_cells_buf, '2f 3f', 'grid_pos', 'color')])
-                    self._ok_cells_n = ok_count
-            if self._ok_cells_n > 0:
-                self.ctx.enable(moderngl.PROGRAM_POINT_SIZE)
-                self._dot_prog['u_center'].value = (self.cx, self.cy)
-                self._dot_prog['u_ppi'].value = self.ppi
-                self._dot_prog['u_screen'].value = (float(self.w), float(self.h))
-                self._dot_prog['u_square'].value = 1
-                self._ok_cells_vao.render(moderngl.POINTS,
-                                          vertices=self._ok_cells_n)
-                self.ctx.disable(moderngl.PROGRAM_POINT_SIZE)
-                self._dot_prog['u_square'].value = 0
-
-        # ── fetched image overlays ──
-        if self._fetched_textures and self.ppi >= FETCH_MIN_PPI:
-            ppi = self.ppi
-            for idx, (tex, gx, gy) in self._fetched_textures.items():
-                sx0 = (gx - self.cx) * ppi + self.w / 2
-                sy0 = (gy - self.cy) * ppi + self.h / 2
-                sx1 = sx0 + ppi
-                sy1 = sy0 + ppi
-                if sx1 < 0 or sx0 > self.w or sy1 < 0 or sy0 > self.h:
-                    continue
-                x0 = 2.0 * sx0 / self.w - 1.0
-                x1 = 2.0 * sx1 / self.w - 1.0
-                y0 = 1.0 - 2.0 * sy1 / self.h
-                y1 = 1.0 - 2.0 * sy0 / self.h
-                tex.use(0)
-                self._overlay_prog['u_tex'].value = 0
-                self._overlay_prog['u_rect'].value = (x0, y0, x1, y1)
-                self._overlay_vao.render(moderngl.TRIANGLE_STRIP)
-
-        # ── link-check dots (cached buffer) ──
-        if self._show_dots and self._dot_n > 0 and self._dot_vao is not None:
-            self.ctx.enable(moderngl.BLEND | moderngl.PROGRAM_POINT_SIZE)
-            self.ctx.blend_func = (
-                moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
+    def _render_ok_cells(self):
+        """Draw undimmed ok cells when in dim mode and zoomed out past hi-res."""
+        if not (self._dim_mode and self.ppi < FETCH_MIN_PPI and self._dot_n > 0):
+            return
+        if self._ok_cells_dirty:
+            self._ok_cells_dirty = False
+            ok_mask = self._link_status[self._dot_checked] == STATUS_CODES['ok']
+            ok_count = ok_mask.sum()
+            if self._ok_cells_buf is not None:
+                self._ok_cells_vao.release()
+                self._ok_cells_buf.release()
+                self._ok_cells_buf = None
+                self._ok_cells_vao = None
+                self._ok_cells_n = 0
+            if ok_count > 0:
+                ok_gx = self._dot_gx[ok_mask]
+                ok_gy = self._dot_gy[ok_mask]
+                ok_arr = self._dot_checked[ok_mask]
+                raw_avg = self.data[ok_arr].reshape(ok_count, CH, -1).mean(axis=2)
+                vdata = np.empty((ok_count, 5), dtype='f4')
+                vdata[:, 0] = ok_gx
+                vdata[:, 1] = ok_gy
+                vdata[:, 2] = raw_avg[:, 2] / 255.0  # R (was B)
+                vdata[:, 3] = raw_avg[:, 1] / 255.0  # G
+                vdata[:, 4] = raw_avg[:, 0] / 255.0  # B (was R)
+                self._ok_cells_buf = self.ctx.buffer(vdata.tobytes())
+                self._ok_cells_vao = self.ctx.vertex_array(
+                    self._dot_prog,
+                    [(self._ok_cells_buf, '2f 3f', 'grid_pos', 'color')])
+                self._ok_cells_n = ok_count
+        if self._ok_cells_n > 0:
+            self.ctx.enable(moderngl.PROGRAM_POINT_SIZE)
             self._dot_prog['u_center'].value = (self.cx, self.cy)
             self._dot_prog['u_ppi'].value = self.ppi
             self._dot_prog['u_screen'].value = (float(self.w), float(self.h))
+            self._dot_prog['u_square'].value = 1
+            self._ok_cells_vao.render(moderngl.POINTS,
+                                      vertices=self._ok_cells_n)
+            self.ctx.disable(moderngl.PROGRAM_POINT_SIZE)
             self._dot_prog['u_square'].value = 0
-            self._dot_vao.render(moderngl.POINTS, vertices=self._dot_n)
-            self.ctx.disable(moderngl.BLEND | moderngl.PROGRAM_POINT_SIZE)
 
-        # ── info overlay (on top of dots): metadata or help ──
+    def _render_fetched(self):
+        """Draw fetched image overlays when zoomed in."""
+        if not (self._fetched_textures and self.ppi >= FETCH_MIN_PPI):
+            return
+        ppi = self.ppi
+        for idx, (tex, gx, gy) in self._fetched_textures.items():
+            sx0 = (gx - self.cx) * ppi + self.w / 2
+            sy0 = (gy - self.cy) * ppi + self.h / 2
+            sx1 = sx0 + ppi
+            sy1 = sy0 + ppi
+            if sx1 < 0 or sx0 > self.w or sy1 < 0 or sy0 > self.h:
+                continue
+            x0 = 2.0 * sx0 / self.w - 1.0
+            x1 = 2.0 * sx1 / self.w - 1.0
+            y0 = 1.0 - 2.0 * sy1 / self.h
+            y1 = 1.0 - 2.0 * sy0 / self.h
+            tex.use(0)
+            self._overlay_prog['u_tex'].value = 0
+            self._overlay_prog['u_rect'].value = (x0, y0, x1, y1)
+            self._overlay_vao.render(moderngl.TRIANGLE_STRIP)
+
+    def _render_dots(self):
+        """Draw link-check status dots."""
+        if not (self._show_dots and self._dot_n > 0 and self._dot_vao is not None):
+            return
+        self.ctx.enable(moderngl.BLEND | moderngl.PROGRAM_POINT_SIZE)
+        self.ctx.blend_func = (
+            moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
+        self._dot_prog['u_center'].value = (self.cx, self.cy)
+        self._dot_prog['u_ppi'].value = self.ppi
+        self._dot_prog['u_screen'].value = (float(self.w), float(self.h))
+        self._dot_prog['u_square'].value = 0
+        self._dot_vao.render(moderngl.POINTS, vertices=self._dot_n)
+        self.ctx.disable(moderngl.BLEND | moderngl.PROGRAM_POINT_SIZE)
+
+    def _render_info_overlay(self):
+        """Draw metadata or help overlay on top of everything."""
         overlay_tex = None
         overlay_tw = overlay_th = 0
         if self._show_help:
@@ -1766,31 +1786,33 @@ class Viewer:
             self._render_meta_texture(self._hover_idx)
             overlay_tex = self._meta_tex
             overlay_tw, overlay_th = self._meta_tw, self._meta_th
-        if overlay_tex is not None:
-            mx, my = glfw.get_cursor_pos(self.win)
-            # upper-left of overlay at cursor + offset (screen coords, y-down)
-            ox = mx + META_OFFSET[0]
-            oy = my + META_OFFSET[1]
-            # clamp so overlay stays fully on-screen
-            ox = min(ox, self.w - overlay_tw)
-            oy = min(oy, self.h - overlay_th)
-            ox = max(0, ox)
-            oy = max(0, oy)
-            # convert screen coords (y-down) to NDC (y-up)
-            x0 = 2.0 * ox / self.w - 1.0
-            x1 = 2.0 * (ox + overlay_tw) / self.w - 1.0
-            y0 = 1.0 - 2.0 * (oy + overlay_th) / self.h
-            y1 = 1.0 - 2.0 * oy / self.h
-            self.ctx.enable(moderngl.BLEND)
-            self.ctx.blend_func = (
-                moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
-            overlay_tex.use(0)
-            self._overlay_prog['u_tex'].value = 0
-            self._overlay_prog['u_rect'].value = (x0, y0, x1, y1)
-            self._overlay_vao.render(moderngl.TRIANGLE_STRIP)
-            self.ctx.disable(moderngl.BLEND)
+        if overlay_tex is None:
+            return
+        mx, my = glfw.get_cursor_pos(self.win)
+        # upper-left of overlay at cursor + offset (screen coords, y-down)
+        ox = mx + META_OFFSET[0]
+        oy = my + META_OFFSET[1]
+        # clamp so overlay stays fully on-screen
+        ox = min(ox, self.w - overlay_tw)
+        oy = min(oy, self.h - overlay_th)
+        ox = max(0, ox)
+        oy = max(0, oy)
+        # convert screen coords (y-down) to NDC (y-up)
+        x0 = 2.0 * ox / self.w - 1.0
+        x1 = 2.0 * (ox + overlay_tw) / self.w - 1.0
+        y0 = 1.0 - 2.0 * (oy + overlay_th) / self.h
+        y1 = 1.0 - 2.0 * oy / self.h
+        self.ctx.enable(moderngl.BLEND)
+        self.ctx.blend_func = (
+            moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
+        overlay_tex.use(0)
+        self._overlay_prog['u_tex'].value = 0
+        self._overlay_prog['u_rect'].value = (x0, y0, x1, y1)
+        self._overlay_vao.render(moderngl.TRIANGLE_STRIP)
+        self.ctx.disable(moderngl.BLEND)
 
-    # ── main loop ─────────────────────────────────────────────────────
+    # ── main loop ────────────────────────────────────────────────────
+
     def run(self):
         # Ctrl+C → graceful shutdown through the finally block
         def _sigint(sig, frame):
