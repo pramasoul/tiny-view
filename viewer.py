@@ -11,6 +11,7 @@ Controls:
   Home       reset view
   /          search keywords (type to search, Esc/Enter to cancel)
   Click      check source URL (shows colored dot)
+  H          toggle help overlay
   L          toggle link-check dots and fetched overlays
   C          toggle Hilbert crawl from hovered image
   D          dim all except fetched images (find live sources)
@@ -429,8 +430,9 @@ class Viewer:
                               shape=(NUM_IMAGES, META_REC))
         self._hover_idx = -1      # image index under cursor
 
-        # ── metadata overlay ──
+        # ── metadata / help overlay ──
         self._show_meta = False
+        self._show_help = False
         self._meta_tex = None
         self._meta_idx = -1       # avoid redundant re-renders for same image
         self._meta_tw = 0         # texture width  (pixels)
@@ -551,7 +553,7 @@ class Viewer:
         self._rebuild_dots()
 
         print(f"Hilbert grid {SIDE}×{SIDE} (order {ORDER}) = {NUM_IMAGES:,} images", flush=True)
-        print("Scroll=zoom  Drag=pan  Click=check  C=crawl  D=dim  R=reload  F=full  M=meta  L=dots  /=search  Esc/Q=quit", flush=True)
+        print("Scroll=zoom  Drag=pan  Click=check  C=crawl  D=dim  R=reload  F=full  M=meta  H=help  L=dots  /=search  Esc/Q=quit", flush=True)
 
     # ── properties ────────────────────────────────────────────────────
     @property
@@ -656,6 +658,54 @@ class Viewer:
         self._meta_tw = tw
         self._meta_th = th
         self._meta_idx = idx
+
+    def _render_help_texture(self):
+        """Render help overlay into an RGBA texture (cached)."""
+        if hasattr(self, '_help_tex') and self._help_tex is not None:
+            return
+        lines = [
+            "Scroll     zoom (toward cursor)",
+            "Drag       pan",
+            "Click      check source URL",
+            "F          toggle fullscreen",
+            "M          toggle metadata overlay",
+            "H          toggle this help",
+            "L          toggle link-check dots",
+            "D          dim all except fetched images",
+            "C          toggle Hilbert crawl from cursor",
+            "R          reload ok images from cache/network",
+            "/          search keywords",
+            "Home       reset view",
+            "Esc        windowed (if fullscreen) / quit",
+            "Q          quit",
+        ]
+        font = ImageFont.load_default(size=16)
+        pad = 12
+        line_h = font.getbbox("Ag")[3] + 4
+        # measure width from longest line
+        max_w = max(font.getbbox(ln)[2] for ln in lines)
+        tw = max_w + pad * 2
+        th = line_h * len(lines) + pad * 2
+
+        img = Image.new('RGBA', (tw, th), (0, 0, 0, 200))
+        draw = ImageDraw.Draw(img)
+        y = pad
+        for ln in lines:
+            # highlight the key part
+            parts = ln.split(None, 1)
+            if len(parts) == 2:
+                draw.text((pad, y), parts[0], fill=(120, 220, 255, 255), font=font)
+                kw = font.getbbox(parts[0] + " ")[2]
+                draw.text((pad + kw, y), parts[1], fill=(255, 255, 255, 255), font=font)
+            else:
+                draw.text((pad, y), ln, fill=(255, 255, 255, 255), font=font)
+            y += line_h
+
+        buf = img.tobytes()
+        self._help_tex = self.ctx.texture((tw, th), 4, buf)
+        self._help_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
+        self._help_tw = tw
+        self._help_th = th
 
     # ── keyword search ────────────────────────────────────────────────
     def _find_prefix(self, prefix):
@@ -984,7 +1034,7 @@ class Viewer:
             self.mx, self.my = x, y
             self._dirty = True
         self._update_title(x, y)
-        if self._show_meta:
+        if self._show_meta or self._show_help:
             self._dirty = True
 
     def _on_char(self, _win, codepoint):
@@ -1037,6 +1087,13 @@ class Viewer:
             self._toggle_fullscreen()
         elif key == glfw.KEY_M:
             self._show_meta = not self._show_meta
+            if self._show_meta:
+                self._show_help = False
+            self._dirty = True
+        elif key == glfw.KEY_H:
+            self._show_help = not self._show_help
+            if self._show_help:
+                self._show_meta = False
             self._dirty = True
         elif key == glfw.KEY_L:
             self._show_dots = not self._show_dots
@@ -1346,6 +1403,7 @@ class Viewer:
         if len(vgx) > 0 and len(vgy) > 0:
             mgx, mgy = np.meshgrid(vgx, vgy)
             vidx = hilbert_xy2d(ORDER, mgx.ravel(), mgy.ravel())
+            vidx = vidx[vidx < NUM_IMAGES]
             for i in vidx[self._link_status[vidx] == ok_code]:
                 idx = int(i)
                 if (idx not in self._fetched_index
@@ -1448,32 +1506,40 @@ class Viewer:
             self._dot_vao.render(moderngl.POINTS)
             self.ctx.disable(moderngl.BLEND | moderngl.PROGRAM_POINT_SIZE)
 
-        # ── metadata overlay (on top of dots) ──
-        if self._show_meta and self._hover_idx >= 0:
+        # ── info overlay (on top of dots): metadata or help ──
+        overlay_tex = None
+        overlay_tw = overlay_th = 0
+        if self._show_help:
+            self._render_help_texture()
+            overlay_tex = self._help_tex
+            overlay_tw, overlay_th = self._help_tw, self._help_th
+        elif self._show_meta and self._hover_idx >= 0:
             self._render_meta_texture(self._hover_idx)
-            if self._meta_tex is not None:
-                mx, my = glfw.get_cursor_pos(self.win)
-                # upper-left of overlay at cursor + offset (screen coords, y-down)
-                ox = mx + META_OFFSET[0]
-                oy = my + META_OFFSET[1]
-                # clamp so overlay stays fully on-screen
-                ox = min(ox, self.w - self._meta_tw)
-                oy = min(oy, self.h - self._meta_th)
-                ox = max(0, ox)
-                oy = max(0, oy)
-                # convert screen coords (y-down) to NDC (y-up)
-                x0 = 2.0 * ox / self.w - 1.0
-                x1 = 2.0 * (ox + self._meta_tw) / self.w - 1.0
-                y0 = 1.0 - 2.0 * (oy + self._meta_th) / self.h
-                y1 = 1.0 - 2.0 * oy / self.h
-                self.ctx.enable(moderngl.BLEND)
-                self.ctx.blend_func = (
-                    moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
-                self._meta_tex.use(0)
-                self._overlay_prog['u_tex'].value = 0
-                self._overlay_prog['u_rect'].value = (x0, y0, x1, y1)
-                self._overlay_vao.render(moderngl.TRIANGLE_STRIP)
-                self.ctx.disable(moderngl.BLEND)
+            overlay_tex = self._meta_tex
+            overlay_tw, overlay_th = self._meta_tw, self._meta_th
+        if overlay_tex is not None:
+            mx, my = glfw.get_cursor_pos(self.win)
+            # upper-left of overlay at cursor + offset (screen coords, y-down)
+            ox = mx + META_OFFSET[0]
+            oy = my + META_OFFSET[1]
+            # clamp so overlay stays fully on-screen
+            ox = min(ox, self.w - overlay_tw)
+            oy = min(oy, self.h - overlay_th)
+            ox = max(0, ox)
+            oy = max(0, oy)
+            # convert screen coords (y-down) to NDC (y-up)
+            x0 = 2.0 * ox / self.w - 1.0
+            x1 = 2.0 * (ox + overlay_tw) / self.w - 1.0
+            y0 = 1.0 - 2.0 * (oy + overlay_th) / self.h
+            y1 = 1.0 - 2.0 * oy / self.h
+            self.ctx.enable(moderngl.BLEND)
+            self.ctx.blend_func = (
+                moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
+            overlay_tex.use(0)
+            self._overlay_prog['u_tex'].value = 0
+            self._overlay_prog['u_rect'].value = (x0, y0, x1, y1)
+            self._overlay_vao.render(moderngl.TRIANGLE_STRIP)
+            self.ctx.disable(moderngl.BLEND)
 
     # ── main loop ─────────────────────────────────────────────────────
     def run(self):
