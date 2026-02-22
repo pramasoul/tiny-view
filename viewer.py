@@ -160,7 +160,6 @@ DETAIL_MIN_PPI = 4 # show detail textures when images are ≥ this many px on sc
 META_OFFSET = (100, 100)  # overlay offset from cursor (right, down) in pixels
 
 LINK_TIMEOUT = 10
-CRAWL_STOP_RUN = 1024  # stop crawl direction after N consecutive already-checked
 DOT_COLORS = {
     'pending':   (1.0, 0.6, 0.0),
     'ok':        (0.0, 0.9, 0.0),
@@ -1320,24 +1319,39 @@ class Viewer:
 
     # ── Hilbert crawl ────────────────────────────────────────────────
 
+    def _crawl_next_unchecked(self, idx, direction):
+        """Find the next unchecked index from idx in direction, wrapping around."""
+        n = NUM_IMAGES
+        if direction > 0:
+            # search idx+1 .. end, then 0 .. idx
+            tail = np.where(self._link_status[idx + 1:] == 0)[0]
+            if len(tail):
+                return idx + 1 + int(tail[0])
+            head = np.where(self._link_status[:idx] == 0)[0]
+            if len(head):
+                return int(head[-1])  # closest to idx, wrapping backward
+        else:
+            # search idx-1 .. 0, then end .. idx
+            if idx > 0:
+                head = np.where(self._link_status[:idx] == 0)[0]
+                if len(head):
+                    return int(head[-1])
+            tail = np.where(self._link_status[idx + 1:] == 0)[0]
+            if len(tail):
+                return idx + 1 + int(tail[-1])  # closest to idx, wrapping forward
+        return -1  # everything checked
+
     def _crawl_worker(self, start_idx, direction):
-        """Walk the Hilbert curve from start_idx, direction = +1 or -1."""
+        """Walk the curve from start_idx, teleporting over checked regions."""
         slot = 0 if direction > 0 else 1
         label = "fwd" if direction > 0 else "bwd"
         idx = start_idx
-        consec = 0
         while not self._crawl_cancel.is_set():
-            idx += direction
-            if idx < 0 or idx >= NUM_IMAGES:
+            idx = self._crawl_next_unchecked(idx, direction)
+            if idx < 0:
+                if self._verbose:
+                    print(f"  crawl {label}: no unchecked images remain", flush=True)
                 break
-            if self._link_status[idx]:
-                consec += 1
-                if consec >= CRAWL_STOP_RUN:
-                    if self._verbose:
-                        print(f"  crawl {label} stopped: {CRAWL_STOP_RUN} consecutive already-checked at #{idx:,}", flush=True)
-                    break
-                continue   # skip already-checked instantly
-            consec = 0
             self._enqueue_link_check(idx)
             self._crawl_count[slot] += 1
             self._crawl_cancel.wait(0.05)
