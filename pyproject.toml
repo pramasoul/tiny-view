@@ -1,0 +1,18 @@
+[project]
+name = "tiny-images-viewer"
+version = "0.1.0"
+description = "Interactive viewer for the 80 Million Tiny Images dataset"
+requires-python = ">=3.10"
+authors = [{name = "Tom Soulanille", email = "soul@prama.com"}]
+dependencies = [
+    "numpy>=2,<3",
+    "moderngl>=5,<6",
+    "glfw>=2,<3",
+    "pillow>=11,<12",
+]
+
+[project.optional-dependencies]
+plot = ["matplotlib>=3.10,<4"]
+
+[project.scripts]
+tiny-viewer = "viewer:main"

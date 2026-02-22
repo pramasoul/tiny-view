@@ -507,10 +507,8 @@ class Viewer:
                       f"If this is wrong, delete {self._lock_path}",
                       file=sys.stderr, flush=True)
                 sys.exit(1)
-            except (ValueError, ProcessLookupError):
+            except (ValueError, ProcessLookupError, OSError):
                 pass   # stale lock from a crash — take over
-            except PermissionError:
-                pass   # process exists but owned by another user — unlikely
         with open(self._lock_path, 'w') as f:
             f.write(str(os.getpid()))
 
@@ -689,7 +687,8 @@ class Viewer:
 
     def _init_link_status(self):
         self._link_lock = threading.Lock()
-        self._link_pool = concurrent.futures.ThreadPoolExecutor(max_workers=64)
+        self._net_sem = threading.Semaphore(90)   # CGNAT-safe concurrent connections
+        self._link_pool = concurrent.futures.ThreadPoolExecutor(max_workers=256)
         self._link_dirty = False
         self._click_sx = 0.0
         self._click_sy = 0.0
@@ -760,6 +759,9 @@ class Viewer:
             self._fetch_db.execute('ALTER TABLE images ADD COLUMN size INTEGER')
         except sqlite3.OperationalError:
             pass
+        self._fetch_db.execute('''CREATE TABLE IF NOT EXISTS redirects (
+            idx INTEGER PRIMARY KEY,
+            url TEXT NOT NULL)''')
         self._fetch_db.commit()
         need_migrate = self._fetch_db.execute(
             'SELECT COUNT(*) FROM images WHERE offset IS NULL').fetchone()[0]
@@ -900,6 +902,10 @@ class Viewer:
             f"engine:   {meta['search_engine']}",
             f"url:      {meta['source_url'][:80]}",
         ]
+        redir = self._fetch_db.execute(
+            'SELECT url FROM redirects WHERE idx=?', (idx,)).fetchone()
+        if redir:
+            lines.append(f"redir:    {redir[0][:80]}")
         font = ImageFont.load_default(size=16)
         pad = 8
         line_h = font.getbbox("Ag")[3] + 4
@@ -1056,6 +1062,15 @@ class Viewer:
             self._dot_journal.add(idx)
         self._link_dirty = True
 
+    def _save_redirect(self, idx, url):
+        """Store the redirect URL for an image."""
+        try:
+            self._fetch_db.execute(
+                'INSERT OR REPLACE INTO redirects (idx, url) VALUES (?, ?)',
+                (idx, url))
+        except Exception:
+            pass
+
     def _check_link(self, idx, verbose=False):
         """GET the source URL, classify it, and fetch the image (runs in thread pool)."""
         loud = (self._verbose or verbose) and not self._quiet
@@ -1077,23 +1092,44 @@ class Viewer:
                 url = 'http://' + url
             if loud:
                 print(f"  check #{idx} GET {url[:80]}", flush=True)
-            req = urllib.request.Request(
-                url, headers={'User-Agent': 'TinyImagesViewer/1.0'})
-            opener = urllib.request.build_opener(_NoRedirectHandler)
-            resp = opener.open(req, timeout=LINK_TIMEOUT)
-            code = resp.getcode()
-            if not (200 <= code < 300):
-                self._set_link_status(idx, 'error')
-                return
-            ctype = resp.headers.get('Content-Type', '')
-            if not ctype.startswith('image/'):
-                if loud:
-                    print(f"  check #{idx} not image: {ctype}", flush=True)
-                self._set_link_status(idx, 'not_image')
-                return
-            raw = resp.read(16 * 1024 * 1024)  # 16 MB cap
+            headers = {'User-Agent': 'TinyImagesViewer/1.0'}
+            # First try without redirects to detect moved URLs
+            # Semaphore limits concurrent connections (CGNAT-safe)
+            with self._net_sem:
+                req = urllib.request.Request(url, headers=headers)
+                opener = urllib.request.build_opener(_NoRedirectHandler)
+                redirected = False
+                try:
+                    resp = opener.open(req, timeout=LINK_TIMEOUT)
+                except urllib.error.HTTPError as redir:
+                    if redir.code not in (301, 302, 307, 308):
+                        raise
+                    # Follow the redirect
+                    new_url = redir.headers.get('Location', '')
+                    if not new_url:
+                        self._set_link_status(idx, 'moved')
+                        return
+                    if loud:
+                        print(f"  check #{idx} {redir.code}→{new_url[:80]}", flush=True)
+                    self._save_redirect(idx, new_url)
+                    req2 = urllib.request.Request(new_url, headers=headers)
+                    resp = urllib.request.urlopen(req2, timeout=LINK_TIMEOUT)
+                    redirected = True
+                code = resp.getcode()
+                if not (200 <= code < 300):
+                    self._set_link_status(idx, 'error')
+                    return
+                ctype = resp.headers.get('Content-Type', '')
+                if not ctype.startswith('image/'):
+                    if loud:
+                        print(f"  check #{idx} not image: {ctype}", flush=True)
+                    self._set_link_status(idx,
+                                          'moved' if redirected else 'not_image')
+                    return
+                raw = resp.read(16 * 1024 * 1024)  # 16 MB cap
             if loud:
-                print(f"  check #{idx} ok {len(raw)} bytes", flush=True)
+                print(f"  check #{idx} ok {len(raw)} bytes"
+                      f"{' (redirected)' if redirected else ''}", flush=True)
             img = Image.open(io.BytesIO(raw)).convert('RGB')
             w, h = img.size
             s = min(w, h)
@@ -1112,9 +1148,7 @@ class Viewer:
             with self._fetched_lock:
                 self._fetched_queue.append((idx, int(gx), int(gy), pixels))
         except urllib.error.HTTPError as e:
-            if e.code in (301, 302, 307, 308):
-                self._set_link_status(idx, 'moved')
-            elif e.code == 404:
+            if e.code == 404:
                 self._set_link_status(idx, 'not_found')
             else:
                 self._set_link_status(idx, 'error')
@@ -2139,7 +2173,7 @@ class Viewer:
             glfw.terminate()
 
 
-if __name__ == '__main__':
+def main():
     parser = argparse.ArgumentParser(
         description='Interactive viewer for the 80 Million Tiny Images dataset')
     parser.add_argument('--data-dir', default=None,
@@ -2154,3 +2188,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
     Viewer(data_dir=args.data_dir, verbose=args.verbose,
            quiet=args.quiet, layout=args.layout).run()
+
+
+if __name__ == '__main__':
+    main()

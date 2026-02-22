@@ -2,7 +2,7 @@
 authors = ["Tom Soulanille <soul@prama.com>"]
 channels = ["conda-forge"]
 name = "tiny"
-platforms = ["linux-64"]
+platforms = ["linux-64", "win-64"]
 version = "0.1.0"
 
 [tasks]
