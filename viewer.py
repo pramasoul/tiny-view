@@ -12,7 +12,8 @@ Controls:
   /          search keywords (type to search, Esc/Enter to cancel)
   Click      check source URL (shows colored dot)
   H          toggle help overlay
-  L          toggle link-check dots and fetched overlays
+  L          toggle link-check dots
+  O          toggle fetched image overlays (compare with dataset)
   C          toggle curve crawl from hovered image
   D          dim all except fetched images (find live sources)
   R          reload ok images from cache (or network fallback)
@@ -693,6 +694,7 @@ class Viewer:
         self._click_sx = 0.0
         self._click_sy = 0.0
         self._show_dots = True
+        self._show_fetched = True
 
         # persistent link status (mmap'd byte array)
         if not os.path.exists(self._link_cache):
@@ -936,6 +938,7 @@ class Viewer:
             "M          toggle metadata overlay",
             "H          toggle this help",
             "L          toggle link-check dots",
+            "O          toggle fetched image overlays",
             "D          dim all except fetched images",
             "C          toggle curve crawl from cursor",
             "R          reload ok images from cache/network",
@@ -1513,6 +1516,9 @@ class Viewer:
         elif key == glfw.KEY_R:
             self._reload_ok_images()
             self._dirty = True
+        elif key == glfw.KEY_O:
+            self._show_fetched = not self._show_fetched
+            self._dirty = True
         elif key == glfw.KEY_P:
             self._show_preview = not self._show_preview
             if not self._show_preview and self._preview_tex is not None:
@@ -1974,7 +1980,7 @@ class Viewer:
 
     def _render_fetched(self):
         """Draw fetched image overlays when zoomed in."""
-        if not (self._fetched_textures and self.ppi >= FETCH_MIN_PPI):
+        if not (self._show_fetched and self._fetched_textures and self.ppi >= FETCH_MIN_PPI):
             return
         ppi = self.ppi
         for idx, (tex, gx, gy) in self._fetched_textures.items():
