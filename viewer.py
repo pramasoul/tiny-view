@@ -631,6 +631,8 @@ class Viewer:
         glfw.set_char_callback(self.win, self._on_char)
 
         self.ctx = moderngl.create_context()
+        self.ctx.clear(0.0, 0.0, 0.0)
+        glfw.swap_buffers(self.win)
 
         quad = np.array([-1, -1, 1, -1, -1, 1, 1, 1], dtype='f4')
         self.prog = self.ctx.program(vertex_shader=VERT, fragment_shader=FRAG)
@@ -744,6 +746,7 @@ class Viewer:
 
         self._fetch_db = sqlite3.connect(
             os.path.join(self._fetch_dir, 'index.db'), check_same_thread=False)
+        self._db_lock = threading.Lock()
         self._fetch_db.execute('PRAGMA journal_mode=WAL')
         self._fetch_db.execute('''CREATE TABLE IF NOT EXISTS images (
             idx INTEGER PRIMARY KEY,
@@ -903,8 +906,9 @@ class Viewer:
             f"engine:   {meta['search_engine']}",
             f"url:      {meta['source_url'][:80]}",
         ]
-        redir = self._fetch_db.execute(
-            'SELECT url FROM redirects WHERE idx=?', (idx,)).fetchone()
+        with self._db_lock:
+            redir = self._fetch_db.execute(
+                'SELECT url FROM redirects WHERE idx=?', (idx,)).fetchone()
         if redir:
             lines.append(f"redir:    {redir[0][:80]}")
         font = ImageFont.load_default(size=16)
@@ -1067,9 +1071,10 @@ class Viewer:
     def _save_redirect(self, idx, url):
         """Store the redirect URL for an image."""
         try:
-            self._fetch_db.execute(
-                'INSERT OR REPLACE INTO redirects (idx, url) VALUES (?, ?)',
-                (idx, url))
+            with self._db_lock:
+                self._fetch_db.execute(
+                    'INSERT OR REPLACE INTO redirects (idx, url) VALUES (?, ?)',
+                    (idx, url))
         except Exception:
             pass
 
@@ -1237,9 +1242,10 @@ class Viewer:
         """Save a fetched PIL image to the current tar shard. Returns True on success."""
         try:
             with self._shard_lock:
-                if self._fetch_db.execute(
-                        'SELECT 1 FROM images WHERE idx=?', (idx,)).fetchone():
-                    return True
+                with self._db_lock:
+                    if self._fetch_db.execute(
+                            'SELECT 1 FROM images WHERE idx=?', (idx,)).fetchone():
+                        return True
                 jpeg_buf = io.BytesIO()
                 img.save(jpeg_buf, format='JPEG', quality=90)
                 jpeg_data = jpeg_buf.getvalue()
@@ -1257,13 +1263,14 @@ class Viewer:
                 if pos >= FETCH_SHARD_MAX:
                     self._shard_num += 1
                     shard = self._open_shard()
-                self._fetch_db.execute(
-                    'INSERT INTO images (idx, shard, width, height, offset, size) VALUES (?,?,?,?,?,?)',
-                    (idx, shard, w, h, data_offset, len(jpeg_data)))
-                self._shard_dirty += 1
-                if self._shard_dirty >= 50:
-                    self._fetch_db.commit()
-                    self._shard_dirty = 0
+                with self._db_lock:
+                    self._fetch_db.execute(
+                        'INSERT INTO images (idx, shard, width, height, offset, size) VALUES (?,?,?,?,?,?)',
+                        (idx, shard, w, h, data_offset, len(jpeg_data)))
+                    self._shard_dirty += 1
+                    if self._shard_dirty >= 50:
+                        self._fetch_db.commit()
+                        self._shard_dirty = 0
                 return True
         except Exception as e:
             if self._verbose:
@@ -1272,8 +1279,9 @@ class Viewer:
 
     def _load_fetched(self, idx):
         """Load a fetched image from the tar cache. Returns pixels array or None."""
-        row = self._fetch_db.execute(
-            'SELECT shard, offset, size FROM images WHERE idx=?', (idx,)).fetchone()
+        with self._db_lock:
+            row = self._fetch_db.execute(
+                'SELECT shard, offset, size FROM images WHERE idx=?', (idx,)).fetchone()
         if row is None:
             return None
         shard_name, offset, size = row
@@ -1427,6 +1435,73 @@ class Viewer:
         self._dirty = True
         self._viewport_changed = True
 
+    def _debug_cell(self, sx, sy):
+        """Dump diagnostic info about the cell under the cursor."""
+        ppi = self.ppi
+        gx_f = self.cx + (sx - self.w / 2) / ppi
+        gy_f = self.cy + (sy - self.h / 2) / ppi
+        ix, iy = int(math.floor(gx_f)), int(math.floor(gy_f))
+        print(f"\n=== DEBUG CELL at screen ({sx:.0f},{sy:.0f}) ===", flush=True)
+        print(f"  grid float: ({gx_f:.3f}, {gy_f:.3f})  int: ({ix}, {iy})", flush=True)
+        print(f"  grid size: {self._grid_w}x{self._grid_h}  ppi: {ppi:.2f}", flush=True)
+        print(f"  viewport center: ({self.cx:.3f}, {self.cy:.3f})", flush=True)
+        if ix < 0 or iy < 0 or ix >= self._grid_w or iy >= self._grid_h:
+            print(f"  OUT OF BOUNDS", flush=True)
+            return
+        idx = int(self._xy2d(ix, iy))
+        print(f"  xy2d({ix},{iy}) = {idx}", flush=True)
+        if idx < 0 or idx >= NUM_IMAGES:
+            print(f"  INVALID INDEX (hole or out of range)", flush=True)
+            return
+        # reverse check
+        rx, ry = self._d2xy(np.int64(idx))
+        print(f"  d2xy({idx}) = ({int(rx)}, {int(ry)})  "
+              f"{'OK' if int(rx) == ix and int(ry) == iy else 'MISMATCH!'}", flush=True)
+        # link status
+        ls = int(self._link_status[idx])
+        ls_name = {v: k for k, v in STATUS_CODES.items()}.get(ls, f'unknown({ls})')
+        print(f"  link_status: {ls} ({ls_name})", flush=True)
+        # fetched texture state
+        if idx in self._fetched_textures:
+            tex, tgx, tgy = self._fetched_textures[idx]
+            match = 'OK' if tgx == ix and tgy == iy else f'MISMATCH! expected ({ix},{iy})'
+            print(f"  fetched_tex: gx={tgx} gy={tgy} tex={tex.size}  {match}", flush=True)
+        else:
+            print(f"  fetched_tex: NOT LOADED", flush=True)
+        # fi_set / fi arrays
+        in_fi = idx in self._fi_set
+        print(f"  fi_set: {in_fi}", flush=True)
+        if in_fi and len(self._fi_idx) > 0:
+            fi_mask = self._fi_idx == idx
+            if fi_mask.any():
+                fi_pos = np.where(fi_mask)[0][0]
+                fi_gx_v = int(self._fi_gx[fi_pos])
+                fi_gy_v = int(self._fi_gy[fi_pos])
+                match = 'OK' if fi_gx_v == ix and fi_gy_v == iy else f'MISMATCH! expected ({ix},{iy})'
+                print(f"  fi_arrays: gx={fi_gx_v} gy={fi_gy_v}  {match}", flush=True)
+        # loading state
+        if idx in self._fetched_loading:
+            print(f"  fetched_loading: YES (in flight)", flush=True)
+        # DB record
+        with self._db_lock:
+            row = self._fetch_db.execute(
+                'SELECT shard, width, height, offset, size FROM images WHERE idx=?',
+                (idx,)).fetchone()
+        if row:
+            shard, w, h, off, sz = row
+            print(f"  db: shard={shard} {w}x{h} offset={off} size={sz}", flush=True)
+        else:
+            print(f"  db: NOT IN CACHE", flush=True)
+        with self._db_lock:
+            redir = self._fetch_db.execute(
+                'SELECT url FROM redirects WHERE idx=?', (idx,)).fetchone()
+        if redir:
+            print(f"  redirect: {redir[0][:120]}", flush=True)
+        # keyword
+        kw = self._keyword(idx)
+        print(f"  keyword: {kw}", flush=True)
+        print(f"=== END DEBUG ===\n", flush=True)
+
     def _on_button(self, win, btn, action, _mods):
         if btn == glfw.MOUSE_BUTTON_LEFT:
             if action == glfw.PRESS:
@@ -1441,6 +1516,9 @@ class Viewer:
                     idx = self._screen_to_image_idx(rx, ry)
                     if idx >= 0:
                         self._enqueue_link_check(idx, verbose=True)
+        elif btn == glfw.MOUSE_BUTTON_RIGHT and action == glfw.PRESS:
+            rx, ry = glfw.get_cursor_pos(win)
+            self._debug_cell(rx, ry)
 
     def _on_cursor(self, win, x, y):
         if self.dragging:
