@@ -18,6 +18,8 @@ Controls:
   D          dim all except fetched images (find live sources)
   R          reload ok images from cache (or network fallback)
   P          toggle hi-res preview popup
+  +/-        zoom preview popup (1x – 16x, powers of two)
+  N          toggle preview filter (linear / nearest)
 """
 
 import argparse
@@ -310,6 +312,48 @@ out vec4 frag;
 void main() {
     vec2 uv = vec2(v_uv.x, 1.0 - v_uv.y);
     frag = texture(u_tex, uv);
+}
+"""
+
+PREVIEW_FRAG = """
+#version 330
+in vec2 v_uv;
+uniform sampler2D u_tex;
+uniform vec2  u_tex_size;   // texture dimensions in pixels
+uniform float u_sigma;      // Gaussian sigma in texels (0 = nearest/bypass)
+out vec4 frag;
+
+void main() {
+    vec2 uv = vec2(v_uv.x, 1.0 - v_uv.y);
+    if (u_sigma <= 0.0) {
+        frag = texture(u_tex, uv);
+        return;
+    }
+    // Gaussian reconstruction in screen space: for each output fragment,
+    // find its continuous position in the texel grid and gather nearby
+    // texel centers, weighting by Gaussian distance from that position.
+    vec2 pos = uv * u_tex_size - 0.5;       // continuous texel coord (center-based)
+    ivec2 base = ivec2(floor(pos));          // integer texel of bottom-left neighbor
+    int r = int(ceil(2.0 * u_sigma - 0.5)); // support radius in texels
+    float inv2s2 = -0.5 / (u_sigma * u_sigma);
+    vec2 texel = 1.0 / u_tex_size;
+    float wsum = 0.0;
+    vec3 acc = vec3(0.0);
+    for (int dy = -r; dy <= r + 1; dy++) {
+        for (int dx = -r; dx <= r + 1; dx++) {
+            ivec2 tc = base + ivec2(dx, dy);
+            // texel center in continuous coords
+            vec2 center = vec2(tc) + 0.5;
+            vec2 d = pos - center + 0.5;
+            float d2 = dot(d, d);
+            float w = exp(d2 * inv2s2);
+            // sample at texel center (+ 0.5 to go from integer to UV)
+            vec2 suv = (vec2(tc) + 0.5) * texel;
+            acc += w * texture(u_tex, suv).rgb;
+            wsum += w;
+        }
+    }
+    frag = vec4(acc / wsum, 1.0);
 }
 """
 
@@ -679,13 +723,21 @@ class Viewer:
         self._preview_idx = -1
         self._preview_tw = 0
         self._preview_th = 0
+        self._preview_zoom = 0          # exponent: scale = 2**zoom, range 0..4
+        self._preview_nearest = False   # True = NEAREST, False = LINEAR
 
         self._overlay_prog = self.ctx.program(
             vertex_shader=OVERLAY_VERT, fragment_shader=OVERLAY_FRAG)
         overlay_quad = np.array([0, 0, 1, 0, 0, 1, 1, 1], dtype='f4')
+        overlay_buf = self.ctx.buffer(overlay_quad)
         self._overlay_vao = self.ctx.vertex_array(
             self._overlay_prog,
-            [(self.ctx.buffer(overlay_quad), '2f', 'pos')])
+            [(overlay_buf, '2f', 'pos')])
+        self._preview_prog = self.ctx.program(
+            vertex_shader=OVERLAY_VERT, fragment_shader=PREVIEW_FRAG)
+        self._preview_vao = self.ctx.vertex_array(
+            self._preview_prog,
+            [(overlay_buf, '2f', 'pos')])
 
     def _init_link_status(self):
         self._link_lock = threading.Lock()
@@ -946,6 +998,8 @@ class Viewer:
             "C          toggle curve crawl from cursor",
             "R          reload ok images from cache/network",
             "P          toggle hi-res preview popup",
+            "+/-        zoom preview (1x\u201316x, powers of two)",
+            "N          toggle preview filter (linear/nearest)",
             "/          search keywords",
             "Home       reset view",
             "Esc        windowed (if fullscreen) / quit",
@@ -1613,10 +1667,21 @@ class Viewer:
             self._dirty = True
         elif key == glfw.KEY_P:
             self._show_preview = not self._show_preview
-            if not self._show_preview and self._preview_tex is not None:
-                self._preview_tex.release()
-                self._preview_tex = None
-                self._preview_idx = -1
+            if not self._show_preview:
+                if self._preview_tex is not None:
+                    self._preview_tex.release()
+                    self._preview_tex = None
+                    self._preview_idx = -1
+                self._preview_zoom = 0
+            self._dirty = True
+        elif key == glfw.KEY_N and self._show_preview:
+            self._preview_nearest = not self._preview_nearest
+            self._dirty = True
+        elif key in (glfw.KEY_EQUAL, glfw.KEY_KP_ADD) and self._show_preview:
+            self._preview_zoom = min(4, self._preview_zoom + 1)
+            self._dirty = True
+        elif key in (glfw.KEY_MINUS, glfw.KEY_KP_SUBTRACT) and self._show_preview:
+            self._preview_zoom = max(0, self._preview_zoom - 1)
             self._dirty = True
 
     # ── fullscreen ───────────────────────────────────────────────────
@@ -2127,14 +2192,17 @@ class Viewer:
                 return
             h, w = pixels.shape[:2]
             tex = self.ctx.texture((w, h), 3, pixels.tobytes())
-            tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+            # Use NEAREST sampling so the Gaussian shader reads exact texels;
+            # hardware LINEAR would blur before the shader gets to filter.
+            tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
             self._preview_tex = tex
             self._preview_tw = w
             self._preview_th = h
             self._preview_idx = idx
-        # position: bottom-right corner of popup anchored left-and-up from cursor
+        # apply magnification (powers of two)
+        scale = 1 << self._preview_zoom
         mx, my = glfw.get_cursor_pos(self.win)
-        tw, th = self._preview_tw, self._preview_th
+        tw, th = self._preview_tw * scale, self._preview_th * scale
         ox = mx - META_OFFSET[0] - tw
         oy = my - META_OFFSET[1] - th
         # clamp to screen
@@ -2146,9 +2214,18 @@ class Viewer:
         y0 = 1.0 - 2.0 * (oy + th) / self.h
         y1 = 1.0 - 2.0 * oy / self.h
         self._preview_tex.use(0)
-        self._overlay_prog['u_tex'].value = 0
-        self._overlay_prog['u_rect'].value = (x0, y0, x1, y1)
-        self._overlay_vao.render(moderngl.TRIANGLE_STRIP)
+        self._preview_prog['u_tex'].value = 0
+        self._preview_prog['u_rect'].value = (x0, y0, x1, y1)
+        self._preview_prog['u_tex_size'].value = (float(self._preview_tw),
+                                                   float(self._preview_th))
+        # sigma: 0 in nearest mode or at 1:1, otherwise fixed Gaussian
+        # reconstruction width of sqrt(2)/2 texels for smooth inter-texel blending
+        if self._preview_nearest or self._preview_zoom == 0:
+            sigma = 0.0
+        else:
+            sigma = 0.7071067811865476  # sqrt(2)/2
+        self._preview_prog['u_sigma'].value = sigma
+        self._preview_vao.render(moderngl.TRIANGLE_STRIP)
 
     def _render_info_overlay(self):
         """Draw metadata or help overlay on top of everything."""
