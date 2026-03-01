@@ -573,10 +573,22 @@ class Viewer:
         self._init_view()
         self._init_search()
         self._init_window()        # GLFW + moderngl + shaders + avg texture
+        glfw.poll_events()
         self._init_overlays()      # metadata/help overlay shader + state
+        glfw.poll_events()
         self._init_link_status()   # mmap, dict, thread pool, dot buffer
+        glfw.poll_events()
         self._init_shard_cache()   # fetch_dir, sqlite, tar shards, fi_* arrays
+        glfw.poll_events()
         self._init_crawl()         # crawl threads, status line state
+        # Register input callbacks only after all state is initialized,
+        # so poll_events() above can't trigger partially-built handlers.
+        glfw.set_scroll_callback(self.win, self._on_scroll)
+        glfw.set_mouse_button_callback(self.win, self._on_button)
+        glfw.set_cursor_pos_callback(self.win, self._on_cursor)
+        glfw.set_key_callback(self.win, self._on_key)
+        glfw.set_char_callback(self.win, self._on_char)
+        self._ready = True
         self._log(f"{self._layout.title()} grid {self._grid_w}×{self._grid_h} = {NUM_IMAGES:,} images")
         self._log("Scroll=zoom  Drag=pan  Click=check  C=crawl  D=dim  R=reload  P=preview  F=full  M=meta  H=help  L=dots  /=search  Esc/Q=quit")
 
@@ -636,6 +648,7 @@ class Viewer:
         self._det_key = None
         self._det_tex = None
         self._dirty = True
+        self._ready = False
 
         # background detail builder
         self._bg_thread = None
@@ -667,16 +680,13 @@ class Viewer:
         glfw.make_context_current(self.win)
         glfw.swap_interval(1)
 
-        glfw.set_scroll_callback(self.win, self._on_scroll)
-        glfw.set_mouse_button_callback(self.win, self._on_button)
-        glfw.set_cursor_pos_callback(self.win, self._on_cursor)
-        glfw.set_framebuffer_size_callback(self.win, self._on_resize)
-        glfw.set_key_callback(self.win, self._on_key)
-        glfw.set_char_callback(self.win, self._on_char)
-
         self.ctx = moderngl.create_context()
         self.ctx.clear(0.0, 0.0, 0.0)
         glfw.swap_buffers(self.win)
+        # Register resize and refresh callbacks early so the viewport tracks
+        # the window during init and live resizes fill with black.
+        glfw.set_framebuffer_size_callback(self.win, self._on_resize)
+        glfw.set_window_refresh_callback(self.win, self._on_refresh)
 
         quad = np.array([-1, -1, 1, -1, -1, 1, 1, 1], dtype='f4')
         self.prog = self.ctx.program(vertex_shader=VERT, fragment_shader=FRAG)
@@ -760,9 +770,13 @@ class Viewer:
         snapshot = np.array(self._link_status)
         checked = np.nonzero(snapshot)[0]
         del snapshot
+        next_poll = time.monotonic() + 0.1
         for i in checked:
             self._link_checks[int(i)] = STATUS_NAMES.get(
                 int(self._link_status[i]), 'error')
+            if time.monotonic() >= next_poll:
+                glfw.poll_events()
+                next_poll = time.monotonic() + 0.1
         if checked.size:
             self._log(f"Restored {checked.size:,} link checks from cache")
 
@@ -1575,6 +1589,8 @@ class Viewer:
             self._debug_cell(rx, ry)
 
     def _on_cursor(self, win, x, y):
+        if not glfw.get_window_attrib(win, glfw.FOCUSED):
+            return
         if self.dragging:
             ppi = self.ppi
             self.cx -= (x - self.mx) / ppi
@@ -1603,6 +1619,15 @@ class Viewer:
             self.ctx.viewport = (0, 0, w, h)
             self._dirty = True
             self._viewport_changed = True
+
+    def _on_refresh(self, win):
+        if self._ready:
+            if self._dirty:
+                self._dirty = False
+                self._render()
+        else:
+            self.ctx.clear(0.0, 0.0, 0.0)
+        glfw.swap_buffers(win)
 
     def _on_key(self, win, key, _sc, action, _mods):
         if action not in (glfw.PRESS, glfw.REPEAT):
