@@ -775,7 +775,7 @@ class Viewer:
         # dot shader + cached dot buffer
         self._dot_prog = self.ctx.program(
             vertex_shader=DOT_VERT, fragment_shader=DOT_FRAG)
-        self._dot_pos = {}
+        self._dot_pos = np.full(NUM_IMAGES, -1, dtype=np.int32)
         self._dot_checked = np.empty(0, dtype=np.int64)
         self._dot_gx = np.empty(0, dtype='f4')
         self._dot_gy = np.empty(0, dtype='f4')
@@ -855,12 +855,13 @@ class Viewer:
             self._fi_idx = arr
             self._fi_gx = gx.astype(np.int32)
             self._fi_gy = gy.astype(np.int32)
-            self._fi_set = set(int(i) for i in all_cached)
+            self._fi_cached = np.zeros(NUM_IMAGES, dtype=bool)
+            self._fi_cached[arr] = True
         else:
             self._fi_idx = np.empty(0, dtype=np.int64)
             self._fi_gx = np.empty(0, dtype=np.int32)
             self._fi_gy = np.empty(0, dtype=np.int32)
-            self._fi_set = set()
+            self._fi_cached = np.zeros(NUM_IMAGES, dtype=bool)
 
     def _init_crawl(self):
         self._crawl_cancel = threading.Event()
@@ -1469,7 +1470,7 @@ class Viewer:
         if counts[7]: parts.append(f"no_url:{counts[7]}")
         if counts[8]: parts.append(f"!img:{counts[8]}")
         line = ' '.join(parts)
-        line += f" | cached:{len(self._fi_set)} pend:{pending} total:{total}"
+        line += f" | cached:{np.count_nonzero(self._fi_cached)} pend:{pending} total:{total}"
         print(f"\r{line}\033[K", end='', flush=True)
         self._status_shown = True
 
@@ -1527,8 +1528,8 @@ class Viewer:
         else:
             print(f"  fetched_tex: NOT LOADED", flush=True)
         # fi_set / fi arrays
-        in_fi = idx in self._fi_set
-        print(f"  fi_set: {in_fi}", flush=True)
+        in_fi = self._fi_cached[idx]
+        print(f"  fi_cached: {in_fi}", flush=True)
         if in_fi and len(self._fi_idx) > 0:
             fi_mask = self._fi_idx == idx
             if fi_mask.any():
@@ -1904,8 +1905,8 @@ class Viewer:
             return False
         new_idx, new_gx, new_gy = [], [], []
         for idx, gx, gy, pixels in queue:
-            if idx not in self._fi_set:
-                self._fi_set.add(idx)
+            if not self._fi_cached[idx]:
+                self._fi_cached[idx] = True
                 new_idx.append(idx)
                 new_gx.append(gx)
                 new_gy.append(gy)
@@ -1966,7 +1967,7 @@ class Viewer:
             vidx = vidx[(vidx >= 0) & (vidx < NUM_IMAGES)]
             for i in vidx[self._link_status[vidx] == ok_code]:
                 idx = int(i)
-                if (idx not in self._fi_set
+                if (not self._fi_cached[idx]
                         and idx not in self._fetched_textures
                         and idx not in self._fetched_loading):
                     self._fetched_loading.add(idx)
@@ -2003,7 +2004,7 @@ class Viewer:
             self._dot_journal = set()
         self._dot_journal_had_updates = bool(journal)
 
-        if self._dot_n == 0 and not self._dot_pos:
+        if self._dot_n == 0:
             # Cold start: full scan of mmap to find all checked indices
             snapshot = np.array(self._link_status)
             checked = np.nonzero(snapshot)[0].astype(np.int64)
@@ -2019,7 +2020,7 @@ class Viewer:
             vdata[:, 2:5] = colors
             self._dot_ensure_capacity(n)
             self._dot_buf.write(vdata.tobytes())
-            self._dot_pos = {int(idx): i for i, idx in enumerate(checked)}
+            self._dot_pos[checked] = np.arange(n, dtype=np.int32)
             self._dot_checked = checked
             self._dot_gx = gx.astype('f4')
             self._dot_gy = gy.astype('f4')
@@ -2034,7 +2035,7 @@ class Viewer:
         new_dots = []
         color_updates = []
         for idx in journal:
-            if idx in self._dot_pos:
+            if self._dot_pos[idx] >= 0:
                 color_updates.append(idx)
             else:
                 new_dots.append(idx)
@@ -2063,8 +2064,8 @@ class Viewer:
             vdata[:, 2:5] = colors
             self._dot_buf.write(vdata.tobytes(),
                                 offset=self._dot_n * self._DOT_STRIDE)
-            for i, idx in enumerate(new_dots):
-                self._dot_pos[idx] = self._dot_n + i
+            self._dot_pos[new_arr] = np.arange(self._dot_n,
+                                               self._dot_n + n_new, dtype=np.int32)
             # Extend cached arrays for ok-cells feature
             self._dot_checked = np.concatenate([self._dot_checked, new_arr])
             self._dot_gx = np.concatenate([self._dot_gx, ngx.astype('f4')])
@@ -2190,7 +2191,7 @@ class Viewer:
         if not self._show_preview or self.ppi < DETAIL_MIN_PPI:
             return
         idx = self._hover_idx
-        if idx < 0 or idx not in self._fi_set:
+        if idx < 0 or not self._fi_cached[idx]:
             if self._preview_tex is not None:
                 self._preview_tex.release()
                 self._preview_tex = None
