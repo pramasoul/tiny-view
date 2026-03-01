@@ -766,19 +766,9 @@ class Viewer:
             del fp
         self._link_status = np.memmap(self._link_cache, dtype='uint8', mode='r+',
                                       shape=(NUM_IMAGES,))
-        self._link_checks = {}
-        snapshot = np.array(self._link_status)
-        checked = np.nonzero(snapshot)[0]
-        del snapshot
-        next_poll = time.monotonic() + 0.1
-        for i in checked:
-            self._link_checks[int(i)] = STATUS_NAMES.get(
-                int(self._link_status[i]), 'error')
-            if time.monotonic() >= next_poll:
-                glfw.poll_events()
-                next_poll = time.monotonic() + 0.1
-        if checked.size:
-            self._log(f"Restored {checked.size:,} link checks from cache")
+        n_checked = int(np.count_nonzero(self._link_status))
+        if n_checked:
+            self._log(f"Restored {n_checked:,} link checks from cache")
 
         self._dim_mode = False
 
@@ -1121,16 +1111,15 @@ class Viewer:
     def _enqueue_link_check(self, idx, verbose=False):
         """Queue a GET check+fetch for the source URL of image *idx*."""
         with self._link_lock:
-            if idx in self._link_checks:
+            if self._link_status[idx] != 0:
                 return
-            self._link_checks[idx] = 'pending'
+            self._link_status[idx] = STATUS_CODES['pending']
         self._dirty = True
         self._link_pool.submit(self._check_link, idx, verbose)
 
     def _set_link_status(self, idx, status):
         """Update link status in memory, mmap, and dot journal."""
         with self._link_lock:
-            self._link_checks[idx] = status
             self._link_status[idx] = STATUS_CODES.get(status, 5)
         with self._dot_journal_lock:
             self._dot_journal.add(idx)
@@ -1382,8 +1371,9 @@ class Viewer:
     def _reload_ok_images(self):
         """Reload all 'ok' images from cache (or network fallback)."""
         with self._link_lock:
-            ok_indices = [i for i, s in self._link_checks.items()
-                          if s == 'ok' and i not in self._fetched_textures]
+            all_ok = np.nonzero(self._link_status == STATUS_CODES['ok'])[0]
+            ok_indices = [int(i) for i in all_ok
+                          if i not in self._fetched_textures]
         if not ok_indices:
             if self._verbose:
                 print("No ok images to reload", flush=True)
